@@ -1,0 +1,60 @@
+---
+# SMC 4h bot (SmcElliottStrategy) — the Docker equivalent of `./run_smc.sh` with no arguments.
+# Runbook: docs/docker-smc.md
+#
+#   docker compose -f docker-compose.smc.yml up -d --build
+#
+# Do not run this while ./run_smc.sh is active on the host: both would use the same Telegram
+# token (409 Conflict) and compete for port 8091.
+# Explicit project name. Without it Compose derives it from the directory and shares a namespace
+# with the repo's own docker-compose.yml, where `down --remove-orphans` from either file would
+# delete the other's containers.
+name: freqtrade-smc
+
+services:
+  freqtrade-smc:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.smc
+    image: freqtrade-smc:local
+    container_name: freqtrade-smc-4h
+    # container_name only prevents a second container of this name. It does NOT stop
+    # ./run_smc.sh on the host — pgrep and Docker cannot see each other. Stopping the host bot
+    # before `up` remains a manual step (docs/docker-smc.md §1).
+    restart: unless-stopped
+    # freqtrade handles SIGTERM, but as PID 1 that only holds while every code path keeps its
+    # handler installed. init: true guarantees the signal is delivered and reaps subprocesses.
+    init: true
+    # Telegram token and exchange key/secret come from .env at runtime — they are empty in
+    # config.json. api_server.password and jwt_secret_key are NOT: they are baked from
+    # config.json, and .env should override them via FREQTRADE__API_SERVER__*.
+    env_file:
+      - .env
+    environment:
+      # Affects log timestamps only. The /analysis scheduler reads its zone from
+      # config-4h.json telegram.analysis_schedule.timezone, independently of TZ.
+      TZ: UTC
+    volumes:
+      # Trade DB, logs and downloaded candles must outlive `docker compose down`.
+      # Strategies and configs are baked into the image, not mounted — rebuild to change them.
+      - "./user_data:/freqtrade/user_data"
+    ports:
+      # Host-side loopback only. Reachable at http://127.0.0.1:8091 from this machine.
+      - "127.0.0.1:8091:8091"
+    # Give freqtrade room to cancel open orders and close the exchange connection cleanly.
+    stop_grace_period: 30s
+    healthcheck:
+      # /api/v1/ping is the only unauthenticated endpoint.
+      # Visibility only: Docker Engine does NOT restart an unhealthy container, and nothing here
+      # consumes the status. `docker compose ps` showing "unhealthy" is a prompt to read logs,
+      # not an automatic recovery.
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8091/api/v1/ping"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

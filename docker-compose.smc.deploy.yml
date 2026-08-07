@@ -1,0 +1,47 @@
+---
+# Bản compose cho SERVER: kéo image sẵn từ registry, KHÔNG build.
+# Runbook: docs/docker-smc.md §7.
+#
+#   docker compose -f docker-compose.smc.deploy.yml pull
+#   docker compose -f docker-compose.smc.deploy.yml up -d
+#
+# Server chỉ cần đúng 2 file: file này + .env. Strategy và config đã bake trong image,
+# nên không cần clone repo.
+name: freqtrade-smc
+
+services:
+  freqtrade-smc:
+    # Ghim tag cụ thể trong .env (SMC_IMAGE=ghcr.io/<ns>/freqtrade-smc:20260807-...).
+    # Không có mặc định :latest — thiếu biến thì compose báo lỗi ngay, tốt hơn là âm thầm
+    # chạy một image không ai biết là bản nào.
+    image: ${SMC_IMAGE:?dat SMC_IMAGE trong .env, vd ghcr.io/<ns>/freqtrade-smc:<tag>}
+    container_name: freqtrade-smc-4h
+    restart: unless-stopped
+    # freqtrade xử lý SIGTERM, nhưng ở vị trí PID 1 điều đó chỉ đúng khi mọi nhánh code còn giữ
+    # handler. init: true đảm bảo tín hiệu tới nơi và thu dọn tiến trình con.
+    init: true
+    # Telegram token, exchange key/secret rỗng trong image -> bắt buộc lấy từ .env.
+    # api_server.password và jwt_secret_key thì ĐÃ bake -> .env phải đè lại (§5).
+    env_file:
+      - .env
+    environment:
+      TZ: UTC
+    volumes:
+      # DB trade, log, nến tải về phải sống sót qua `down` và qua mọi lần đổi image.
+      - "./user_data:/freqtrade/user_data"
+    ports:
+      # Chỉ loopback của server. Xem FreqUI từ máy nhà qua SSH tunnel:
+      #   ssh -L 8091:127.0.0.1:8091 user@server
+      - "127.0.0.1:8091:8091"
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8091/api/v1/ping"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

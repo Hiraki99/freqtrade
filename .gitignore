@@ -115,3 +115,20 @@ target/
 !config_examples/config_freqai.example.json
 
 docker-compose-*.yml
+
+# Bản sao lưu tay của config: `config*.json` ở dòng 2 KHÔNG bắt được chúng vì tên
+# không kết thúc bằng .json (vd config-4h.json.bak-spot197). Chúng là config thật,
+# phải nằm ngoài git giống bản gốc.
+*.bak
+*.bak-*
+*.bak[0-9]*
+
+# BMad
+_bmad/
+_bmad-output/
+
+# Claude
+.claude/
+
+# Strategy nguồn nằm ở strategies/ (được track) — user_data/strategies/ chỉ chứa
+# symlink do ./sync_strategies.sh tạo, nên vẫn ignore theo rule user_data/* ở trên.

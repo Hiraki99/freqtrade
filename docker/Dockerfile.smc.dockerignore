@@ -1,0 +1,78 @@
+# Build-scoped ignore for docker/Dockerfile.smc.
+#
+# BuildKit prefers <dockerfile>.dockerignore over the root .dockerignore, which lets the SMC image
+# bake config.json without editing the upstream-tracked root file.
+#
+# DO NOT add config.json, config-4h.json, strategies/, docker/, pyproject.toml, README.md,
+# requirements.txt or freqtrade/ here — excluding any of them breaks the bake or the pip install,
+# in some cases silently.
+
+# --- Version control and editor state ---
+.git
+.gitignore
+.github
+.vscode
+.devcontainer/
+.claude/
+.mcp.json
+.ipynb_checkpoints
+.*_cache/
+# 136 MB of parsed-source index. Nothing in the image reads it, and it busts the build cache
+# on every reindex.
+.gitnexus/
+
+# --- BMad workflow artifacts ---
+_bmad/
+_bmad-output/
+
+# --- Secrets: supplied at runtime via compose env_file, never baked into a layer ---
+# Globs, not exact names: .env.local / .env.production and stray keys must not reach a layer.
+.env*
+*.pem
+*.key
+*.p12
+
+# --- Runtime state: bind-mounted from the host at /freqtrade/user_data ---
+# Leading **/ matters — a single * never crosses a `/`, so bare `*.sqlite` would only match
+# context-root files and would also miss the -wal / -shm sidecars holding uncommitted trades.
+user_data/
+**/*.sqlite*
+**/*.log
+
+# --- Host-only tooling, not used inside the container ---
+.venv
+*.sh
+docker-compose*.yml
+docker/docker-compose-freqai.yml
+docker/docker-compose-jupyter.yml
+docker/Dockerfile.armhf
+docker/Dockerfile.custom
+docker/Dockerfile.freqai
+docker/Dockerfile.freqai_rl
+docker/Dockerfile.jupyter
+docker/Dockerfile.plot
+freqtrade.service
+freqtrade.service.watchdog
+
+# --- Not needed by a trade-only image ---
+tests/
+docs/
+site/
+mkdocs.yml
+dist/
+build/
+.eggs
+freqtrade.egg-info
+CONTRIBUTING.md
+MANIFEST.in
+.coveragerc
+.pylintrc
+.travis.yml
+requirements-dev.txt
+requirements-freqai.txt
+requirements-freqai-rl.txt
+requirements-plot.txt
+
+# --- Python build noise ---
+**/__pycache__/
+*.py[cod]

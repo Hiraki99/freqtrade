@@ -10,6 +10,7 @@ from datetime import timedelta
 from functools import reduce
 from random import choice, randint
 from string import ascii_uppercase
+from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
@@ -167,9 +168,9 @@ def test_telegram_init(default_conf, mocker, caplog) -> None:
         "['balance'], ['start'], ['stop'], "
         "['forceexit', 'forcesell', 'fx'], ['forcebuy', 'forcelong'], ['forceshort'], "
         "['reload_trade'], ['trades'], ['delete'], ['cancel_open_order', 'coo'], "
-        "['performance'], ['buys', 'entries'], ['exits', 'sells'], ['mix_tags'], "
-        "['stats'], ['daily'], ['weekly'], ['monthly'], "
-        "['count'], ['locks'], ['delete_locks', 'unlock'], "
+        "['buys', 'entries'], ['exits', 'sells'], ['mix_tags'], "
+        "['stats'], ['daily'], ['analysis'], ['smc'], ['scalp'], ['weekly'], ['monthly'], "
+        "['locks'], ['delete_locks', 'unlock'], "
         "['reload_conf', 'reload_config'], ['show_conf', 'show_config'], "
         "['pause', 'stopbuy', 'stopentry'], ['whitelist'], ['blacklist'], "
         "['bl_delete', 'blacklist_delete'], "
@@ -184,17 +185,21 @@ async def test_telegram_startup(default_conf, mocker, caplog) -> None:
     app_mock = MagicMock()
     app_mock.initialize = AsyncMock()
     app_mock.start = AsyncMock()
+    app_mock.stop = AsyncMock()
+    app_mock.shutdown = AsyncMock()
     app_mock.updater.start_polling = AsyncMock()
+    app_mock.updater.stop = AsyncMock()
     app_mock.updater.running = False
-    sleep_mock = mocker.patch("freqtrade.rpc.telegram.asyncio.sleep", AsyncMock())
 
     telegram, _, _ = get_telegram_testobject(mocker, default_conf)
     telegram._app = app_mock
+    telegram._shutdown_event = asyncio.Event()
     await telegram._startup_telegram()
     assert app_mock.initialize.call_count == 1
     assert app_mock.start.call_count == 1
     assert app_mock.updater.start_polling.call_count == 1
-    assert sleep_mock.call_count == 1
+    # updater.running == False -> thoát vòng chờ và teardown đầy đủ trong loop.
+    assert app_mock.shutdown.call_count == 1
 
     # Test telegram Retries and Exceptions
     app_mock.start = AsyncMock(side_effect=Exception("Test exception"))
@@ -207,22 +212,16 @@ async def test_telegram_cleanup(
     default_conf,
     mocker,
 ) -> None:
-    app_mock = MagicMock()
-    app_mock.stop = AsyncMock()
-    app_mock.initialize = AsyncMock()
-
-    updater_mock = MagicMock()
-    updater_mock.stop = AsyncMock()
-    app_mock.updater = updater_mock
-    # mocker.patch('freqtrade.rpc.telegram.Application', app_mock)
-
     telegram, _, _ = get_telegram_testobject(mocker, default_conf)
-    telegram._app = app_mock
     telegram._loop = asyncio.get_running_loop()
     telegram._thread = MagicMock()
+    telegram._shutdown_event = asyncio.Event()
+
     telegram.cleanup()
     await asyncio.sleep(0.1)
-    assert app_mock.stop.call_count == 1
+    # cleanup() chỉ báo dừng + join; teardown (stop/shutdown) chạy trong
+    # _startup_telegram để hoàn tất trước khi loop dừng.
+    assert telegram._shutdown_event.is_set()
     assert telegram._thread.join.call_count == 1
 
 
@@ -1698,23 +1697,6 @@ async def test_force_enter_no_pair(default_conf, update, mocker) -> None:
     assert query.edit_message_text.call_args_list[-1][1]["text"] == "Force enter canceled."
 
 
-async def test_telegram_performance_handle(default_conf_usdt, update, ticker, fee, mocker) -> None:
-    mocker.patch.multiple(
-        EXMS,
-        fetch_ticker=ticker,
-        get_fee=fee,
-    )
-    telegram, _freqtradebot, msg_mock = get_telegram_testobject(mocker, default_conf_usdt)
-
-    # Create some test data
-    create_mock_trades_usdt(fee)
-
-    await telegram._performance(update=update, context=MagicMock())
-    assert msg_mock.call_count == 1
-    assert "Performance" in msg_mock.call_args_list[0][0][0]
-    assert "<code>XRP/USDT\t2.842 USDT (9.47%) (1)</code>" in msg_mock.call_args_list[0][0][0]
-
-
 async def test_telegram_entry_tag_performance_handle(
     default_conf_usdt, update, ticker, fee, mocker
 ) -> None:
@@ -1813,34 +1795,6 @@ async def test_telegram_mix_tag_performance_handle(
 
     assert msg_mock.call_count == 1
     assert "Error" in msg_mock.call_args_list[0][0][0]
-
-
-async def test_count_handle(default_conf, update, ticker, fee, mocker) -> None:
-    mocker.patch.multiple(
-        EXMS,
-        fetch_ticker=ticker,
-        get_fee=fee,
-    )
-    telegram, freqtradebot, msg_mock = get_telegram_testobject(mocker, default_conf)
-    patch_get_signal(freqtradebot)
-
-    freqtradebot.state = State.STOPPED
-    await telegram._count(update=update, context=MagicMock())
-    assert msg_mock.call_count == 1
-    assert "not running" in msg_mock.call_args_list[0][0][0]
-    msg_mock.reset_mock()
-    freqtradebot.state = State.RUNNING
-
-    # Create some test data
-    freqtradebot.enter_positions()
-    msg_mock.reset_mock()
-    await telegram._count(update=update, context=MagicMock())
-
-    msg = (
-        "<pre>  current    max    total stake\n---------  -----  -------------\n"
-        "        1      {}          {}</pre>"
-    ).format(default_conf["max_open_trades"], default_conf["stake_amount"])
-    assert msg in msg_mock.call_args_list[0][0][0]
 
 
 async def test_telegram_lock_handle(default_conf, update, ticker, fee, mocker) -> None:
@@ -2863,14 +2817,14 @@ async def test__send_msg_keyboard(default_conf, mocker, caplog) -> None:
     invalid_keys_list = [["/not_valid", "/profit"], ["/daily"], ["/alsoinvalid"]]
     default_keys_list = [
         ["/daily", "/profit", "/balance"],
-        ["/status", "/status table", "/performance"],
-        ["/count", "/start", "/stop", "/help"],
+        ["/status", "/status table"],
+        ["/start", "/stop", "/help"],
     ]
     default_keyboard = ReplyKeyboardMarkup(default_keys_list)
 
     custom_keys_list = [
         ["/daily", "/stats", "/balance", "/profit", "/profit 5"],
-        ["/count", "/start", "/reload_config", "/help"],
+        ["/analysis", "/start", "/reload_config", "/help"],
     ]
     custom_keyboard = ReplyKeyboardMarkup(custom_keys_list)
 
@@ -2910,7 +2864,7 @@ async def test__send_msg_keyboard(default_conf, mocker, caplog) -> None:
     assert used_keyboard == custom_keyboard
     assert log_has(
         "using custom keyboard from config.json: "
-        "[['/daily', '/stats', '/balance', '/profit', '/profit 5'], ['/count', "
+        "[['/daily', '/stats', '/balance', '/profit', '/profit 5'], ['/analysis', "
         "'/start', '/reload_config', '/help']]",
         caplog,
     )
@@ -3064,3 +3018,635 @@ async def test__tg_info(default_conf_usdt, mocker, update):
     content = context.bot.send_message.call_args[1]["text"]
     assert "Freqtrade Bot Info:\n" in content
     assert '"chat_id": "1235"' in content
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (60000.0, "60,000"),
+        (1234.5, "1,234"),
+        (12.345, "12.35"),
+        (0.0123, "0.0123"),
+        (0.00012345, "0.00012345"),
+    ],
+)
+def test__smc_fmt_price(value, expected):
+    assert Telegram._smc_fmt_price(value) == expected
+
+
+def test__smc_entry_zone_prefers_bull_ob_then_band():
+    # Bull OB ưu tiên -> trả (lo, hi, note, invalidation=đáy OB cho LONG)
+    lv = {"bull_ob_bot": 100.0, "bull_ob_top": 110.0}
+    lo, hi, note, inval = Telegram._smc_entry_zone(lv, 105.0, "long")
+    assert (lo, hi) == (100.0, 110.0) and note == "Bull OB" and inval == 100.0
+
+    # SHORT Bear OB -> invalidation = đỉnh OB
+    lv2 = {"bear_ob_bot": 100.0, "bear_ob_top": 110.0}
+    _, _, note2, inval2 = Telegram._smc_entry_zone(lv2, 105.0, "short")
+    assert note2 == "Bear OB" and inval2 == 110.0
+
+    # Không có OB nhưng có ATR -> dải ±0.25 ATR quanh giá (KHÔNG trả một điểm).
+    lo, hi, note, inval = Telegram._smc_entry_zone({"atr": 4.0}, 105.0)
+    assert (lo, hi) == (104.0, 106.0) and "ATR" in note and inval is None
+
+    # Không có gì -> dải ±0.15% quanh giá, vẫn là một KHOẢNG.
+    lo, hi, note, inval = Telegram._smc_entry_zone({}, 200.0)
+    assert lo < 200.0 < hi and "±0.15%" in note and inval is None
+
+
+def test__smc_price_vs_zone():
+    assert "trong vùng" in Telegram._smc_price_vs_zone(105.0, 100.0, 110.0)
+    assert "trên vùng" in Telegram._smc_price_vs_zone(121.0, 100.0, 110.0)
+    assert "hồi xuống" in Telegram._smc_price_vs_zone(121.0, 100.0, 110.0)
+    assert "dưới vùng" in Telegram._smc_price_vs_zone(90.0, 100.0, 110.0)
+    assert "hồi lên" in Telegram._smc_price_vs_zone(90.0, 100.0, 110.0)
+
+
+def test__smc_liquidity_targets_sources_and_direction():
+    """Mốc TP phải đến từ THANH KHOẢN/CẤU TRÚC, và chỉ lấy mốc phía trước."""
+    lv = {
+        "pivots": [
+            {"type": "L", "price": 58000.0},  # đáy cũ = SSL (phía dưới -> hợp lệ cho SHORT)
+            {"type": "L", "price": 70000.0},  # đáy cũ nhưng nằm TRÊN entry -> phải loại
+            {"type": "H", "price": 66000.0},  # đỉnh cũ -> chỉ dùng cho LONG
+        ],
+        "bull_ob_top": 59000.0,
+        "fvg_bot": 57000.0,
+        "vp_poc": 61000.0,
+        "vp_val": 56000.0,
+        "equilibrium": 62000.0,
+    }
+    got = Telegram._smc_liquidity_targets(lv, 64000.0, "short")
+    prices = [p for p, _ in got]
+    reasons = " ".join(r for _, r in got)
+    assert 58000.0 in prices and "đáy cũ (SSL)" in reasons
+    assert 70000.0 not in prices  # nằm sau lưng -> loại
+    assert 66000.0 not in prices  # đỉnh cũ không phải mục tiêu của SHORT
+    assert 59000.0 in prices and "Bull OB" in reasons
+    assert 57000.0 in prices and "FVG" in reasons
+    assert 61000.0 in prices and "POC" in reasons
+    assert 56000.0 in prices and "VAL" in reasons
+    assert 62000.0 in prices and "equilibrium" in reasons
+
+    # LONG chỉ lấy ĐỈNH cũ (BSL) phía trên; pivot đáy 70000 tuy nằm trên vẫn bị
+    # loại vì buy-side liquidity nằm trên ĐỈNH cũ, không phải trên đáy cũ.
+    up = Telegram._smc_liquidity_targets({"pivots": lv["pivots"]}, 64000.0, "long")
+    assert [p for p, _ in up] == [66000.0]
+
+    # Đỉnh/đáy SWING là mốc giá CÓ THẬT -> vẫn là nguồn thanh khoản hợp lệ
+    # (thay cho mốc "Fib 1.0" cũ). Chỉ lấy đúng phía theo hướng lệnh.
+    sw = Telegram._smc_liquidity_targets(
+        {"swing_high": 68000.0, "swing_low": 55000.0}, 64000.0, "long"
+    )
+    assert [p for p, _ in sw] == [68000.0]
+    assert "đỉnh swing (BSL)" in sw[0][1]
+    sw_dn = Telegram._smc_liquidity_targets(
+        {"swing_high": 68000.0, "swing_low": 55000.0}, 64000.0, "short"
+    )
+    assert [p for p, _ in sw_dn] == [55000.0]
+
+
+def test__smc_tp_ladder_has_no_synthetic_rung():
+    """Thang TP KHÔNG được chứa mốc tổng hợp "R:R 1:2" — chỉ giá có thật.
+
+    Trước đây mốc 2R được chèn thẳng vào thang để R:R luôn nhìn đủ chuẩn. Đó là
+    ngoại suy: không có thanh khoản nào ở mức đó. Khi cấu trúc không với tới 2R,
+    kết luận đúng là bỏ lệnh, không phải thêm một dòng cho đẹp bảng.
+    """
+    lv = {  # nhiều mốc gần entry -> đủ lấp đầy max_rows
+        "pivots": [{"type": "L", "price": p} for p in (59000.0, 58800.0, 58500.0, 58200.0)],
+        "vp_poc": 59500.0,
+        "vp_val": 59200.0,
+        "bull_ob_top": 58900.0,
+        "swing_high": 67000.0,
+        "swing_low": 58000.0,
+    }
+    # risk 700 -> 2R = 60000 - 1400 = 58600, KHÔNG trùng mốc cấu trúc nào.
+    merged, _, _ = Telegram._smc_tp_ladder(lv, 60000.0, 60000.0, 700.0, "short", max_rows=6)
+    assert len(merged) <= 6
+    assert not any("TỐI THIỂU" in name for _, name in merged)
+    assert not any(abs(p - 58600.0) < 1 for p, _ in merged), "mốc 2R tổng hợp vẫn còn"
+    # Mốc cấu trúc XA NHẤT (đáy swing 58000) vẫn phải sống sót khi cắt bớt.
+    assert any(abs(p - 58000.0) < 1 for p, _ in merged)
+    assert all("Fib" not in name for _, name in merged)
+
+
+def test__smc_tp_ladder_keeps_farthest_structural_target():
+    """Mốc CẤU TRÚC xa nhất phải hiển thị, không bị các mốc gần đè mất.
+
+    Regression thật (ETH/USDT 4h): có đáy cũ ở 2.7R nhưng bị cắt, bảng chỉ hiện
+    tới 0.9R + mốc 2R tổng hợp -> giấu đúng mục tiêu thanh khoản tốt nhất.
+    """
+    lv = {
+        "pivots": [
+            {"type": "L", "price": p}
+            for p in (2288.0, 2262.0, 2252.0, 2249.0, 2220.0, 1938.0, 1916.0)
+        ],
+        "vp_poc": 2288.5,
+        "swing_high": 2436.0,
+        "swing_low": 2220.0,
+    }
+    merged, _, _ = Telegram._smc_tp_ladder(lv, 2302.0, 2295.0, 141.0, "short")
+    prices = [p for p, _ in merged]
+    assert any(abs(p - 1916.0) < 1 for p in prices), "mốc cấu trúc xa nhất bị cắt mất"
+    assert abs(merged[-1][0] - 1916.0) < 1  # mốc xa nhất = mốc quyết định R:R xa
+    assert len(merged) <= 6
+
+
+def test__smc_tp_ladder_drops_far_targets_but_reports_them():
+    """Trần khoảng cách: mốc quá xa bị bỏ khỏi thang NHƯNG phải được nói ra.
+
+    Thực đo BTC/USDT 4h: đỉnh cũ ở +41.5% (13R) — đúng cấu trúc, vô dụng để lập
+    kế hoạch. Cắt im lặng sẽ khiến bảng trông như "đã bao hết mốc".
+    """
+    lv = {
+        "pivots": [
+            {"type": "H", "price": 62000.0},  # 2.0R  -> giữ
+            {"type": "H", "price": 66000.0},  # 6.0R  -> giữ
+            {"type": "H", "price": 82850.0},  # 22.8R -> vượt trần 8R, bỏ
+        ]
+    }
+    merged, dropped, _ = Telegram._smc_tp_ladder(lv, 60000.0, 60000.0, 1000.0, "long", max_r=8.0)
+    prices = [p for p, _ in merged]
+    assert 82850.0 not in prices
+    assert [p for p, _ in dropped] == [82850.0]
+    # Mốc xa nhất phải tính SAU khi cắt trần, nếu không R:R xa sẽ trỏ mốc đã bỏ.
+    assert merged[-1][0] == 66000.0
+
+    # Trần được nêu trong ghi chú của plan block, kèm mốc GẦN NHẤT trong số đã bỏ.
+    # Ở đây SL bám đáy OB nên risk chỉ 795 -> cả 66,000 (8.2R) lẫn 82,850 vượt trần.
+    strategy = SimpleNamespace(sl_buffer_pct=SimpleNamespace(value=0.5))
+    lv2 = dict(lv, bull_ob_bot=59000.0, bull_ob_top=59500.0, swing_low=59000.0)
+    out = "\n".join(Telegram._smc_plan_block(strategy, "4h", lv2, 59200.0, "long", 59200.0))
+    assert "Đã bỏ 2 mốc quá xa" in out
+    assert "66,000" in out and "8.2R" in out  # nêu đích danh mốc gần nhất bị bỏ
+    assert "82,850" not in out  # mốc quá xa không còn trong bảng
+
+    # Chưa có SL (rr_risk None) -> trần rơi về % giá.
+    _, dropped_pct, _ = Telegram._smc_tp_ladder(lv, 60000.0, 60000.0, None, "long")
+    assert [p for p, _ in dropped_pct] == [82850.0]  # +38% > trần 25%
+
+
+def test__smc_tp_ladder_drops_targets_not_worth_the_sl():
+    """Regression SOL/USDT: TP nằm SAU mép entry xấu nhất, và TP quá nhỏ so với SL.
+
+    Bảng thật user gặp: SHORT mép bán 73.88, SL 79.27 (risk 5.39) mà TP1 = 74.10
+    — CAO hơn giá bán, tức lệnh LỖ, nhưng hiển thị "0.0R" vì tính bằng trị tuyệt
+    đối. TP2 = 73.39 thì chỉ 0.09R: ôm rủi ro 1R để ăn 0.09R.
+    """
+    lv = {
+        "bull_ob_top": 74.10,  # nằm giữa mép xấu nhất (73.88) và tâm vùng -> LỖ
+        "pivots": [{"type": "L", "price": p} for p in (73.39, 64.04, 60.13)],
+        "vp_val": 73.39,
+        "swing_low": 73.39,
+    }
+    merged, _dropped, too_close = Telegram._smc_tp_ladder(lv, 74.14, 73.88, 5.39, "short")
+    prices = [round(p, 2) for p, _ in merged]
+    # Mốc sau lưng mép xấu nhất KHÔNG được coi là mục tiêu.
+    assert 74.10 not in prices
+    assert 74.10 not in [round(p, 2) for p, _ in too_close]
+    # Mốc 0.09R bị loại vì không tương xứng với SL, nhưng phải được báo lại.
+    assert 73.39 not in prices
+    assert 73.39 in [round(p, 2) for p, _ in too_close]
+    # Chỉ còn mốc đủ lớn: 1.8R và 2.5R.
+    assert prices == [64.04, 60.13]
+    assert all(abs(p - 73.88) / 5.39 >= 0.5 for p in prices)
+
+
+def test__smc_tp_ladder_excludes_fib_extensions():
+    """Fib 1.272/1.618 không còn được sinh ra: chỉ là phép nhân dải swing.
+
+    Đáy swing (mốc "Fib 1.0" cũ) vẫn giữ vì đó là mức giá CÓ THẬT trên chart.
+    """
+    lv = {"swing_high": 66000.0, "swing_low": 60000.0}
+    merged, _, _ = Telegram._smc_tp_ladder(lv, 65000.0, 65000.0, 1000.0, "short")
+    prices = [round(p) for p, _ in merged]
+    assert prices == [60000]  # chỉ đáy swing
+    assert "đáy swing (SSL)" in merged[0][1]
+    assert 58368 not in prices  # 1.272 ext = 66000 - 1.272*6000
+    assert 56292 not in prices  # 1.618 ext
+
+
+def test__smc_plan_block_reports_real_rr_only():
+    """R:R công bố phải ĐO trên mốc cấu trúc thật, tính ở MÉP XẤU NHẤT.
+
+    Không còn dòng "R:R 1 : 2.0 tối thiểu" mặc định lẫn mốc TP 2R tổng hợp — cả
+    hai đều đúng bất kể cấu trúc có với tới hay không, nên vô nghĩa.
+    """
+    strategy = SimpleNamespace(sl_buffer_pct=SimpleNamespace(value=0.5))
+    lv = {
+        "bear_ob_bot": 64800.0,
+        "bear_ob_top": 65400.0,
+        "swing_high": 66956.0,
+        "swing_low": 57800.0,
+    }
+    out = "\n".join(Telegram._smc_plan_block(strategy, "4h", lv, 64026.0, "short", 64026.0))
+    # Giá hiện tại hiển thị + vị trí so với vùng.
+    assert "Giá TT" in out and "64,026" in out and "dưới vùng" in out
+    # Entry là KHOẢNG a-b.
+    assert "64,800-65,400" in out
+    # SHORT: mép xấu nhất = ĐÁY vùng (bán rẻ nhất) -> R:R tính ở đó.
+    assert "tính ở mép 64,800" in out
+    # SL = đỉnh OB + đệm 0.5% = 65400*1.005 = 65727 -> risk 927.
+    assert "65,727" in out
+    # TP duy nhất là đáy swing THẬT 57800 = (64800-57800)/927 = 7.6R.
+    assert "57,800" in out and "đáy swing (SSL)" in out
+    assert "R:R TP1" in out and "1 : 7.6" in out
+    # Không còn mốc/nhãn ngoại suy nào.
+    assert "TỐI THIỂU" not in out and "ngoại suy" not in out
+    assert "62,946" not in out  # mốc 2R tổng hợp cũ
+    assert "BỎ LỆNH" not in out  # 7.6R > 1:2 -> setup hợp lệ
+
+
+def test__smc_plan_block_says_skip_when_structure_cannot_reach_2r():
+    """Cấu trúc thật không với tới 1:2 -> BỎ LỆNH, không bịa mục tiêu cho đủ."""
+    strategy = SimpleNamespace(sl_buffer_pct=SimpleNamespace(value=0.5))
+    lv = {  # OB rộng -> risk 2330; mốc cấu trúc duy nhất phía trước là đáy swing 63000
+        "bear_ob_bot": 64000.0,
+        "bear_ob_top": 66000.0,
+        "swing_high": 66500.0,
+        "swing_low": 63000.0,
+    }
+    out = "\n".join(Telegram._smc_plan_block(strategy, "4h", lv, 64500.0, "short", 64500.0))
+    assert "BỎ LỆNH" in out
+    # mép xấu nhất 64000, SL 66330 -> risk 2330; đáy swing 63000 chỉ cách 1000 = 0.4R
+    # -> dưới sàn 0.5R nên bị loại khỏi bảng, NHƯNG phải nói ra là đã loại.
+    assert "Đã bỏ 1 mốc quá gần, không tương xứng với SL" in out and "0.4R" in out
+    assert "chưa có mốc thanh khoản/cấu trúc nào phía trước" in out
+    # Không được có mốc ngoại suy nào kéo R:R lên cho đủ chuẩn.
+    assert "ngoại suy" not in out and "TỐI THIỂU" not in out
+    assert "62,946" not in out
+
+
+def test__smc_plan_block_full_long_setup():
+    strategy = SimpleNamespace(sl_buffer_pct=SimpleNamespace(value=0.5))
+    lv = {
+        "bull_ob_bot": 59500.0,
+        "bull_ob_top": 60200.0,
+        "swing_low": 59000.0,
+        "swing_high": 62000.0,
+    }
+    out = "\n".join(Telegram._smc_plan_block(strategy, "1h", lv, 60000.0, "long"))
+    assert "KỊCH BẢN CHÍNH: LONG" in out
+    assert "Entry" in out and "59,500-60,200" in out and "Bull OB" in out
+    # SL ngay dưới ĐÁY OB (59500): 59500*(1-0.5%) = 59202.5 -> 59,202
+    assert "59,202" in out and "đáy OB" in out
+    # TP duy nhất = đỉnh swing THẬT 62000; Fib ext 63854 KHÔNG còn được sinh ra.
+    assert "62,000" in out and "đỉnh swing (BSL)" in out
+    assert "63,854" not in out and "Fib 1." not in out
+    # (62000-60200)/997.5 = 1.8R < 2 -> phải khuyên bỏ lệnh thay vì vẽ thêm mốc.
+    assert "R:R xa" in out and "1 : 1.8" in out
+    assert "BỎ LỆNH" in out
+    assert "```" in out  # bảng monospace
+    assert "Trigger" in out and "Vô hiệu hóa" in out
+
+
+def test__smc_indicator_line():
+    def val(v):
+        from math import isnan
+
+        return None if v is None or (isinstance(v, float) and isnan(v)) else v
+
+    # RSI quá bán, giá trên cả 2 EMA và MA20, MACD > signal -> tất cả 🟢.
+    row = {
+        "rsi": 25.0,
+        "ema50": 59000.0,
+        "ema200": 58000.0,
+        "sma20": 59500.0,
+        "macd": 5.0,
+        "macdsignal": 2.0,
+    }
+    assert (
+        Telegram._smc_indicator_line(row, 60000.0, val) == "RSI 25🟢 · EMA 🟢🟢 · MA20 🟢 · MACD 🟢"
+    )
+
+    # RSI quá mua, giá dưới EMA200 & MA20, MACD < signal.
+    row2 = {
+        "rsi": 75.0,
+        "ema50": 61000.0,
+        "ema200": 62000.0,
+        "sma20": 60500.0,
+        "macd": 1.0,
+        "macdsignal": 4.0,
+    }
+    assert (
+        Telegram._smc_indicator_line(row2, 60000.0, val)
+        == "RSI 75🔴 · EMA 🔴🔴 · MA20 🔴 · MACD 🔴"
+    )
+
+    # Thiếu cột chỉ báo (strategy chưa reload) -> trả chuỗi rỗng.
+    assert Telegram._smc_indicator_line({}, 60000.0, val) == ""
+
+
+def test__smc_plan_block_short_setup():
+    strategy = SimpleNamespace(sl_buffer_pct=SimpleNamespace(value=0.5))
+    lv = {
+        "bear_ob_bot": 60000.0,
+        "bear_ob_top": 60500.0,
+        "swing_high": 61000.0,
+        "equilibrium": 59000.0,
+        "swing_low": 57500.0,
+        "bull_ob_top": 58200.0,
+    }
+    out = "\n".join(Telegram._smc_plan_block(strategy, "1h", lv, 60250.0, "short"))
+    assert "KỊCH BẢN CHÍNH: SHORT" in out
+    assert "60,000-60,500" in out and "Bear OB" in out
+    # SL ngay trên ĐỈNH OB (60500): 60500*(1+0.5%) = 60802.5 -> 60,802
+    assert "60,802" in out and "đỉnh OB" in out
+    # TP đều là mốc THẬT: equilibrium 59000, biên Bull OB 58200, đáy swing 57500.
+    assert "57,500" in out and "đáy swing (SSL)" in out
+    assert "59,000" in out and "equilibrium" in out
+    assert "R:R" in out and "Fib" not in out
+
+
+def test__smc_plan_block_sweep_vs_break_around_sl():
+    strategy = SimpleNamespace(sl_buffer_pct=SimpleNamespace(value=0.5))
+    # swing_low 58894 -> SL ~58600. Nến ĐÓNG 59193 (trên SL).
+    lv = {"swing_low": 58894.0, "equilibrium": 63212.0}
+
+    # 1) Live 58541 < SL nhưng nến đóng trên SL -> SWEEP (wick), CHƯA gãy.
+    sweep = "\n".join(Telegram._smc_plan_block(strategy, "4h", lv, 59193.0, "long", 58541.0))
+    assert "QUÉT" in sweep
+    assert "CHƯA xác nhận gãy" in sweep
+    assert "GÃY (BOS" not in sweep  # không kết luận gãy
+
+    # 2) Nến ĐÓNG dưới SL (price 58400) -> cấu trúc GÃY thật.
+    brk = "\n".join(Telegram._smc_plan_block(strategy, "4h", lv, 58400.0, "long", 58300.0))
+    assert "ĐÓNG dưới SL" in brk
+    assert "GÃY (BOS giảm)" in brk
+
+    # 3) Cả live lẫn nến đóng đều trên SL -> không cảnh báo.
+    ok = "\n".join(Telegram._smc_plan_block(strategy, "4h", lv, 59193.0, "long", 59000.0))
+    assert "QUÉT" not in ok and "GÃY" not in ok
+
+
+def test__smc_break_note_reclaim_into_ob():
+    # Live thủng SL nhưng đã về lại TRONG Bull OB -> nhấn mạnh khả năng sweep hợp lệ.
+    lv = {"bull_ob_bot": 58500.0, "bull_ob_top": 59500.0}
+    note = Telegram._smc_break_note("long", 59193.0, 58550.0, 58600.0, lv)
+    assert note is not None
+    assert "SWEEP cao" in note and "VẪN HỢP LỆ" in note
+
+
+def test__smc_plan_block_handles_missing_levels():
+    strategy = SimpleNamespace(sl_buffer_pct=SimpleNamespace(value=0.5))
+    # Có Bull OB nhưng KHÔNG có mốc thanh khoản nào phía trên -> SL dựng được,
+    # TP thì không. Trước đây chỗ này vẫn đẻ ra mốc 2R = 131 từ SL và công bố
+    # "R:R 1 : 2.0" dù chẳng có gì ở 131 — đúng kiểu số đẹp mà rỗng.
+    lv = {"bull_ob_bot": 100.0, "bull_ob_top": 110.0}
+    out = "\n".join(Telegram._smc_plan_block(strategy, "4h", lv, 105.0, "long"))
+    assert "đáy OB" in out  # SL bám đáy OB (không n/a)
+    assert "chưa có mốc thanh khoản/cấu trúc nào phía trước" in out
+    assert "131" not in out and "TỐI THIỂU" not in out
+    assert "1 : 2.0" not in out
+    assert "BỎ LỆNH" in out  # không biết lời tới đâu -> không vào lệnh
+
+    # Thiếu cả OB lẫn swing -> SL n/a.
+    out2 = "\n".join(Telegram._smc_plan_block(strategy, "4h", {}, 105.0, "long"))
+    assert "SL" in out2 and "n/a" in out2
+
+
+def test__smc_signal_report_no_data():
+    strategy = SimpleNamespace(timeframe="4h", sl_buffer_pct=SimpleNamespace(value=0.5))
+    out = Telegram._smc_signal_report(strategy, "BTC/USDT", ["4h"], {}, {}, None, "now")
+    assert len(out) == 1 and "Không lấy được dữ liệu" in out[0]
+
+
+def test__smc_signal_report_full_template():
+    strategy = SimpleNamespace(timeframe="4h", sl_buffer_pct=SimpleNamespace(value=0.5))
+    base = {
+        "internal_trend": -1,
+        "swing_trend": -1,
+        "swing_high": 61000.0,
+        "swing_low": 58894.0,
+        "equilibrium": 60000.0,
+        "premium_level": 60800.0,
+        "bear_ob_bot": 60500.0,
+        "bear_ob_top": 61200.0,
+        "bull_ob_bot": 58800.0,
+        "bull_ob_top": 59400.0,
+        "fvg_bot": 59100.0,
+        "fvg_top": 59300.0,
+        "rsi": 34.0,
+        "ema50": 59800.0,
+        "ema200": 60500.0,
+        "macd": -2.0,
+        "macdsignal": -1.0,
+    }
+    levels = {tf: dict(base) for tf in ("15m", "1h", "4h", "1d")}
+    prices = {tf: 59193.0 for tf in levels}
+    out = "\n".join(
+        Telegram._smc_signal_report(
+            strategy, "BTC/USDT", ["15m", "1h", "4h", "1d"], levels, prices, 58541.0, "2026-06-30"
+        )
+    )
+    # 7 mục theo template
+    for header in (
+        "Bức tranh đa khung",
+        "Cấu trúc & SMC",
+        "Thanh khoản",
+        "Sóng Elliott",
+        "Hợp lưu kỹ thuật",
+        "Kế hoạch giao dịch",
+        "Quản trị rủi ro",
+    ):
+        assert header in out
+    # Đồng thuận giảm -> ưu tiên SHORT
+    assert "Vị thế ưu tiên: *SHORT*" in out
+    assert "KỊCH BẢN CHÍNH: SHORT" in out
+    # Giá đã quét SSL (live 58541 < swing_low 58894)
+    assert "quét SSL" in out
+    assert "golden pocket" in out  # Fib retracement (entry)
+    assert "Sóng Elliott" in out and "ước lượng" in out  # mục 4 có ước lượng
+    # TP là thanh khoản thật (đáy swing / FVG / OB đối diện), không phải Fib ext.
+    assert "đáy swing (SSL)" in out
+    assert "Fib 1." not in out and "ngoại suy" not in out
+    assert "NFA" in out  # disclaimer
+
+
+def test__smc_fib_line():
+    lv = {"swing_high": 61000.0, "swing_low": 59000.0}  # range 2000
+    # SHORT: từ đáy lên -> 0.618 = 59000+1236 = 60236 ; 0.786 = 60572
+    short = Telegram._smc_fib_line(lv, "short")
+    assert short is not None and "golden pocket" in short and "premium" in short
+    assert "60,236" in short and "60,572" in short
+    # LONG: từ đỉnh xuống -> 0.618 = 61000-1236 = 59764 ; 0.786 = 59428
+    long = Telegram._smc_fib_line(lv, "long")
+    assert "discount" in long and "59,428" in long and "59,764" in long
+    # Thiếu swing -> None
+    assert Telegram._smc_fib_line({"swing_high": 100.0}, "long") is None
+
+
+def test__smc_quick_pairs():
+    # Spot: lấy nguyên cặp có trong whitelist, cặp thiếu dựng theo hậu tố cặp đầu.
+    got = Telegram._smc_quick_pairs(["ETH/USDT", "BTC/USDT", "SUI/USDT"], "USDT")
+    assert got == ["BTC/USDT", "ETH/USDT", "XAU/USDT", "SOL/USDT"]
+    # Futures: cặp thiếu (XAU) phải giữ hậu tố :USDT của whitelist, không rớt về spot.
+    fut = Telegram._smc_quick_pairs(["BTC/USDT:USDT", "ETH/USDT:USDT"], "USDT")
+    assert fut == ["BTC/USDT:USDT", "ETH/USDT:USDT", "XAU/USDT:USDT", "SOL/USDT:USDT"]
+    # Whitelist rỗng -> dựng toàn bộ theo stake currency.
+    assert Telegram._smc_quick_pairs([], "USDC") == [
+        "BTC/USDC",
+        "ETH/USDC",
+        "XAU/USDC",
+        "SOL/USDC",
+    ]
+
+
+async def test_smc_quick_handle(default_conf, update, mocker) -> None:
+    telegram, freqtradebot, msg_mock = get_telegram_testobject(mocker, default_conf)
+    freqtradebot.config["stake_currency"] = "USDT"
+    freqtradebot.active_pair_whitelist = ["BTC/USDT", "ETH/USDT"]
+    report_mock = mocker.patch.object(
+        telegram, "_build_analysis_report", AsyncMock(return_value="report")
+    )
+
+    # /smc không tham số -> header + 1 báo cáo 4h cho mỗi cặp cố định
+    context = MagicMock()
+    context.args = []
+    await telegram._smc(update=update, context=context)
+
+    assert msg_mock.call_count == 5
+    assert "4h" in msg_mock.call_args_list[0][0][0]
+    assert [c[0][1] for c in report_mock.call_args_list] == [
+        "BTC/USDT",
+        "ETH/USDT",
+        "XAU/USDT",
+        "SOL/USDT",
+    ]
+    assert all(c[0][2] == ["4h"] for c in report_mock.call_args_list)
+
+    # Một cặp lỗi không được chặn các cặp còn lại — vẫn đủ 4 tin nhắn sau header.
+    msg_mock.reset_mock()
+    report_mock.side_effect = [RuntimeError("boom"), "report", "report", "report"]
+    await telegram._smc(update=update, context=context)
+    assert msg_mock.call_count == 5
+    assert "BTC/USDT" in msg_mock.call_args_list[1][0][0]  # cặp lỗi -> cảnh báo, không im lặng
+    assert "⚠️" in msg_mock.call_args_list[1][0][0]
+
+    # Có tham số -> ủy quyền cho /analysis (1 cặp, các khung user gõ)
+    msg_mock.reset_mock()
+    report_mock.reset_mock(side_effect=True)
+    context.args = ["ETH", "1d"]
+    await telegram._smc(update=update, context=context)
+    assert msg_mock.call_count == 1
+    assert report_mock.call_args[0][1] == "ETH/USDT"
+    assert report_mock.call_args[0][2] == ["1d"]
+
+
+async def test_smc_scalp_handle(default_conf, update, mocker) -> None:
+    telegram, freqtradebot, msg_mock = get_telegram_testobject(mocker, default_conf)
+    freqtradebot.config["stake_currency"] = "USDT"
+    freqtradebot.active_pair_whitelist = ["BTC/USDT", "ETH/USDT"]
+    report_mock = mocker.patch.object(
+        telegram, "_build_analysis_report", AsyncMock(return_value="report")
+    )
+
+    # /scalp không tham số -> 4 cặp cố định, khung 5m + 15m ĐÚNG THỨ TỰ thấp -> cao
+    context = MagicMock()
+    context.args = []
+    await telegram._scalp(update=update, context=context)
+
+    assert msg_mock.call_count == 5
+    assert [c[0][1] for c in report_mock.call_args_list] == [
+        "BTC/USDT",
+        "ETH/USDT",
+        "XAU/USDT",
+        "SOL/USDT",
+    ]
+    # Thứ tự quyết định khung nào là bias (cuối) và khung nào dựng kế hoạch (đầu).
+    assert all(c[0][2] == ["5m", "15m"] for c in report_mock.call_args_list)
+
+    # Có tham số -> 1 cặp; khung user gõ đè mặc định
+    msg_mock.reset_mock()
+    report_mock.reset_mock()
+    context.args = ["SOL", "5m", "15m", "1h"]
+    await telegram._scalp(update=update, context=context)
+    assert report_mock.call_count == 1
+    assert report_mock.call_args[0][1] == "SOL/USDT"
+    assert report_mock.call_args[0][2] == ["5m", "15m", "1h"]
+
+    # Chỉ có cặp, không có khung -> vẫn dùng mặc định scalp (không rơi về 15m/1h/4h/1d)
+    report_mock.reset_mock()
+    context.args = ["ETH"]
+    await telegram._scalp(update=update, context=context)
+    assert report_mock.call_args[0][2] == ["5m", "15m"]
+
+
+def test__smc_signal_report_scalp_timeframes():
+    """Khung 5m+15m: bias lấy khung cuối (15m), kế hoạch dựng trên khung đầu (5m)."""
+    strategy = SimpleNamespace(timeframe="4h", minimal_roi={}, stoploss=-0.1)
+    lv_5m = {"swing_trend": 1, "internal_trend": 1, "swing_high": 101.0, "swing_low": 99.0}
+    lv_15m = {"swing_trend": 1, "internal_trend": 1, "swing_high": 102.0, "swing_low": 98.0}
+    out = "\n".join(
+        Telegram._smc_signal_report(
+            strategy,
+            "BTC/USDT",
+            ["5m", "15m"],
+            {"5m": lv_5m, "15m": lv_15m},
+            {"5m": 100.0, "15m": 100.0},
+            100.0,
+            "now",
+        )
+    )
+    assert "Loại: Scalping" in out
+    assert "Chính (15m)" in out  # bias = khung cao nhất
+    assert "*2️⃣ Cấu trúc & SMC* (`5m`)" in out  # kế hoạch = khung thấp nhất
+
+
+def test__next_analysis_slot():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo("Asia/Ho_Chi_Minh")
+    # interval 4h, neo 7h -> slots 3,7,11,15,19,23
+    nxt = Telegram._next_analysis_slot(datetime(2026, 7, 1, 8, 30, tzinfo=tz), 4, 7)
+    assert nxt.hour == 11 and nxt.day == 1  # 08:30 -> 11:00 cùng ngày
+    nxt2 = Telegram._next_analysis_slot(datetime(2026, 7, 1, 23, 30, tzinfo=tz), 4, 7)
+    assert nxt2.hour == 3 and nxt2.day == 2  # 23:30 -> 03:00 hôm sau
+    nxt3 = Telegram._next_analysis_slot(datetime(2026, 7, 1, 7, 0, tzinfo=tz), 4, 7)
+    assert nxt3.hour == 11  # đúng 07:00 -> mốc kế tiếp, không lặp lại chính nó
+
+
+def test__smc_wave_estimate():
+    def piv(*seq):
+        return [{"type": "H" if p[0] == "H" else "L", "price": p[1]} for p in seq]
+
+    # Uptrend: đáy(100) H(110) L(105) H(120) -> sau đáy có 3 chân -> SÓNG 3 (đẩy)
+    up = Telegram._smc_wave_estimate(piv(("L", 100), ("H", 110), ("L", 105), ("H", 120)), 1)
+    assert "SÓNG 3" in up and "đẩy" in up and "TĂNG" in up
+
+    # Sau đáy có 5 chân -> sóng đẩy cuối, cảnh giác đảo chiều
+    five = Telegram._smc_wave_estimate(
+        piv(("L", 100), ("H", 110), ("L", 105), ("H", 120), ("L", 112), ("H", 130)), 1
+    )
+    assert "SÓNG 5" in five and "đảo chiều" in five
+
+    # >5 chân -> điều chỉnh A-B-C
+    abc = Telegram._smc_wave_estimate(
+        piv(("L", 100), ("H", 110), ("L", 105), ("H", 120), ("L", 112), ("H", 130), ("L", 118)), 1
+    )
+    assert "SÓNG A" in abc and "A-B-C" in abc
+
+    # Không có pivot / không trend -> None
+    assert Telegram._smc_wave_estimate([], 1) is None
+    assert Telegram._smc_wave_estimate(piv(("L", 100), ("H", 110)), 0) is None
+
+
+def test__smc_elliott_note():
+    # Uptrend + giá discount (dưới eq) -> hồi quy, chờ sóng đẩy
+    up_pull = "\n".join(
+        Telegram._smc_elliott_note(
+            {"swing_trend": 1, "internal_trend": -1, "equilibrium": 100.0}, 95.0
+        )
+    )
+    assert "Sóng Elliott" in up_pull and "điều chỉnh" in up_pull
+    # Downtrend thuận đà
+    dn = "\n".join(
+        Telegram._smc_elliott_note(
+            {"swing_trend": -1, "internal_trend": -1, "equilibrium": 100.0}, 95.0
+        )
+    )
+    assert "ĐẨY GIẢM" in dn
+    # Luôn có caveat heuristic
+    assert "Heuristic" in up_pull
