@@ -1,0 +1,12 @@
+{
+    "$schema": "https://schema.freqtrade.io/schema.json",
+    "_comment_naming": "Song song với docker/smc-overrides.json (bot 4h). Không đặt tên config-docker-5m.json vì .gitignore dòng 2 là 'config*.json' — mọi tên bắt đầu bằng config sẽ bị bỏ khỏi git một cách âm thầm.",
+    "_comment_db_url": "config-5m.json dùng đường dẫn sqlite tương đối -> rơi vào WORKDIR /freqtrade của container, KHÔNG phải volume -> mất sạch trade mỗi lần `docker compose down`. Bốn dấu gạch sau sqlite: làm đường dẫn tuyệt đối. Tên file giữ nguyên tradesv3.5m-futures.sqlite như bản chạy host để copy DB sang là dùng được ngay.",
+    "db_url": "sqlite:////freqtrade/user_data/tradesv3.5m-futures.sqlite",
+    "_comment_api_server": "config-5m.json bind 127.0.0.1, trong container nghĩa là chỉ loopback CỦA container -> cổng publish không truy cập được. 0.0.0.0 an toàn vì compose chỉ publish ra 127.0.0.1 của host. Cổng 8082 giữ đúng như bản host để lệnh curl/ssh tunnel không phải nhớ hai con số khác nhau.",
+    "api_server": {
+        "enabled": true,
+        "listen_ip_address": "0.0.0.0",
+        "listen_port": 8082
+    }
+}

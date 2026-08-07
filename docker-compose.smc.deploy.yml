@@ -1,47 +1,94 @@
 ---
 # Bản compose cho SERVER: kéo image sẵn từ registry, KHÔNG build.
-# Runbook: docs/docker-smc.md §7.
+# Chạy cả hai bot SMC: 4h (swing) và 5m (scalping). Runbook: docs/docker-smc.md §7.
 #
 #   docker compose -f docker-compose.smc.deploy.yml pull
 #   docker compose -f docker-compose.smc.deploy.yml up -d
+#
+# Chỉ muốn một bot thì thêm tên service vào cuối:
+#   docker compose -f docker-compose.smc.deploy.yml up -d freqtrade-smc
 #
 # Server chỉ cần đúng 2 file: file này + .env. Strategy và config đã bake trong image,
 # nên không cần clone repo.
 name: freqtrade-smc
 
+# Phần dùng chung. Hai bot khác nhau đúng 5 thứ: tên container, lớp config, cổng, logfile,
+# token Telegram.
+x-smc-common: &smc-common
+  # Ghim tag cụ thể trong .env (SMC_IMAGE=ghcr.io/<ns>/freqtrade-smc:20260807-...).
+  # Không có mặc định :latest — thiếu biến thì compose báo lỗi ngay, tốt hơn là âm thầm
+  # chạy một image không ai biết là bản nào.
+  # MỘT image chạy cả hai bot: cùng strategy, cùng package, chỉ khác tham số lúc chạy.
+  # Deploy vì thế là nguyên tử — không có cửa cho 4h và 5m chạy lệch bản.
+  image: ${SMC_IMAGE:?dat SMC_IMAGE trong .env, vd ghcr.io/<ns>/freqtrade-smc:<tag>}
+  restart: unless-stopped
+  # freqtrade xử lý SIGTERM, nhưng ở vị trí PID 1 điều đó chỉ đúng khi mọi nhánh code còn giữ
+  # handler. init: true đảm bảo tín hiệu tới nơi và thu dọn tiến trình con.
+  init: true
+  # Telegram token, exchange key/secret rỗng trong image -> bắt buộc lấy từ .env.
+  # api_server.password và jwt_secret_key thì ĐÃ bake -> .env phải đè lại (§5).
+  env_file:
+    - .env
+  volumes:
+    # DB trade, log, nến tải về phải sống sót qua `down` và qua mọi lần đổi image.
+    # Hai container dùng chung thư mục này nhưng KHÁC file DB và khác file log.
+    - "./user_data:/freqtrade/user_data"
+  stop_grace_period: 30s
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
 services:
+  # ---------------------------------------------------------------- 4h swing --
   freqtrade-smc:
-    # Ghim tag cụ thể trong .env (SMC_IMAGE=ghcr.io/<ns>/freqtrade-smc:20260807-...).
-    # Không có mặc định :latest — thiếu biến thì compose báo lỗi ngay, tốt hơn là âm thầm
-    # chạy một image không ai biết là bản nào.
-    image: ${SMC_IMAGE:?dat SMC_IMAGE trong .env, vd ghcr.io/<ns>/freqtrade-smc:<tag>}
+    <<: *smc-common
     container_name: freqtrade-smc-4h
-    restart: unless-stopped
-    # freqtrade xử lý SIGTERM, nhưng ở vị trí PID 1 điều đó chỉ đúng khi mọi nhánh code còn giữ
-    # handler. init: true đảm bảo tín hiệu tới nơi và thu dọn tiến trình con.
-    init: true
-    # Telegram token, exchange key/secret rỗng trong image -> bắt buộc lấy từ .env.
-    # api_server.password và jwt_secret_key thì ĐÃ bake -> .env phải đè lại (§5).
-    env_file:
-      - .env
     environment:
       TZ: UTC
-    volumes:
-      # DB trade, log, nến tải về phải sống sót qua `down` và qua mọi lần đổi image.
-      - "./user_data:/freqtrade/user_data"
     ports:
       # Chỉ loopback của server. Xem FreqUI từ máy nhà qua SSH tunnel:
       #   ssh -L 8091:127.0.0.1:8091 user@server
       - "127.0.0.1:8091:8091"
-    stop_grace_period: 30s
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8091/api/v1/ping"]
       interval: 60s
       timeout: 10s
       retries: 3
       start_period: 90s
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+
+  # -------------------------------------------------------------- 5m scalping --
+  freqtrade-smc-5m:
+    <<: *smc-common
+    container_name: freqtrade-smc-5m
+    environment:
+      TZ: UTC
+      # Token PHẢI khác bot 4h — chung token thì Telegram trả 409 Conflict và CẢ HAI mất
+      # thông báo. env_file nạp FREQTRADE__TELEGRAM__TOKEN (token 4h) vào mọi container nên
+      # dòng này bắt buộc phải có để đè lại; `environment` thắng `env_file`.
+      FREQTRADE__TELEGRAM__TOKEN: ${BOT_5M_TG_TOKEN:?dat BOT_5M_TG_TOKEN trong .env - token rieng cho bot 5m, tao o @BotFather}
+    ports:
+      #   ssh -L 8082:127.0.0.1:8082 user@server
+      - "127.0.0.1:8082:8082"
+    # Ghi đè CMD của image (mặc định là bot 4h).
+    command:
+      - trade
+      - --strategy
+      - SmcElliottStrategy
+      - --strategy-path
+      - /freqtrade/strategies
+      - --config
+      - /freqtrade/config.json
+      - --config
+      - /freqtrade/config-5m.json
+      - --config
+      - /freqtrade/docker/smc-5m-overrides.json
+      - --logfile
+      - /freqtrade/user_data/logs/smc-5m.log
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8082/api/v1/ping"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 90s

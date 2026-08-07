@@ -56,9 +56,10 @@ from freqtrade.util import (
 
 MAX_MESSAGE_LENGTH = MessageLimit.MAX_TEXT_LENGTH
 
-# /smc không tham số: báo cáo nhanh 4 cặp cố định trên MỘT khung (xem `_smc`).
+# /smc không tham số: báo cáo nhanh 4 cặp cố định (xem `_smc`).
 # Khác /analysis — lệnh đó phân tích 1 cặp trên nhiều khung.
 SMC_QUICK_BASES = ("BTC", "ETH", "XAU", "SOL")
+# Khung dự phòng khi không đọc được khung giao dịch của bot (xem `_smc_quick_timeframes`).
 SMC_QUICK_TIMEFRAME = "4h"
 
 # /scalp: cùng 4 cặp nhưng khung ngắn, cho lệnh trong ngày.
@@ -1908,6 +1909,32 @@ class Telegram(RPCHandler):
         suffix = sample.split("/", 1)[1] if "/" in sample else stake
         return [by_base.get(base, f"{base}/{suffix}") for base in SMC_QUICK_BASES]
 
+    @staticmethod
+    def _smc_quick_timeframes(ft) -> list[str]:
+        """Khung mặc định của `/smc` — bám theo khung giao dịch của chính bot đang chạy.
+
+        Trước đây cứng là `SMC_QUICK_TIMEFRAME` (4h), nên bot scalping 5m (`./run_smc_5.sh`)
+        bấm /smc lại nhận kế hoạch swing 4h: một báo cáo không liên quan gì tới lệnh mà bot
+        đó thực sự vào, và không có dấu hiệu nào cho thấy nó sai khung.
+
+        Bot khung ngắn (< 1h) trả về cả bộ `SMC_SCALP_TIMEFRAMES` chứ không riêng khung của nó:
+        `_smc_signal_report` lấy `avail[0]` dựng kế hoạch Entry/SL/TP và `avail[-1]` lấy bias,
+        nên danh sách một phần tử sẽ lấy bias ngay trên khung vào lệnh — đúng thứ mà bias đa
+        khung sinh ra để tránh.
+
+        :param ft: FreqtradeBot đang chạy
+        :return: danh sách khung, thứ tự thấp -> cao
+        """
+        from freqtrade.exchange import timeframe_to_minutes
+
+        tf = getattr(ft.strategy, "timeframe", None) or ft.config.get("timeframe")
+        # isinstance chứ không phải truthy: /help cũng gọi hàm này, và ở đó `ft` có thể là
+        # mock (test) — `getattr` trên mock trả về mock, đưa thẳng vào timeframe_to_minutes
+        # sẽ ném lỗi và giết luôn lệnh /help.
+        if not isinstance(tf, str):
+            return [SMC_QUICK_TIMEFRAME]
+        return list(SMC_SCALP_TIMEFRAMES) if timeframe_to_minutes(tf) < 60 else [tf]
+
     async def _send_pair_reports(self, ft, pairs: list[str], tfs: list[str], header: str) -> None:
         """Gửi header rồi mỗi cặp một báo cáo.
 
@@ -1926,9 +1953,11 @@ class Telegram(RPCHandler):
     async def _smc(self, update: Update, context: CallbackContext) -> None:
         """
         Handler for /smc [pair] [tf ...]
-        Không tham số -> báo cáo khung 4h cho 4 cặp cố định (BTC, ETH, XAU, SOL),
-        mỗi cặp một tin nhắn. Có tham số -> hành xử y hệt /analysis.
-        Ví dụ:  /smc            -> BTC, ETH, XAU, SOL trên 4h
+        Không tham số -> báo cáo 4 cặp cố định (BTC, ETH, XAU, SOL) trên khung của chính bot
+        đang chạy (`_smc_quick_timeframes`), mỗi cặp một tin nhắn.
+        Có tham số -> hành xử y hệt /analysis.
+        Ví dụ:  /smc            -> bot 4h: BTC, ETH, XAU, SOL trên 4h
+                                   bot 5m: cùng 4 cặp trên 5m + 15m (giống /scalp)
                 /smc ETH 4h 1d  -> ETH, chỉ 4h và 1d
         """
         if context.args:
@@ -1936,11 +1965,12 @@ class Telegram(RPCHandler):
             return
         ft = self._rpc._freqtrade
         pairs = self._smc_quick_pairs(ft.active_pair_whitelist, ft.config["stake_currency"])
+        tfs = self._smc_quick_timeframes(ft)
         await self._send_pair_reports(
             ft,
             pairs,
-            [SMC_QUICK_TIMEFRAME],
-            f"⚡ *Phân tích nhanh {SMC_QUICK_TIMEFRAME}* — {len(pairs)} cặp",
+            tfs,
+            f"⚡ *Phân tích nhanh {' + '.join(tfs)}* — {len(pairs)} cặp",
         )
 
     @authorized_only
@@ -2995,7 +3025,8 @@ class Telegram(RPCHandler):
             "(bias đa khung, cấu trúc/OB/FVG, thanh khoản, hợp lưu, kế hoạch "
             "Entry/SL/TP, quản trị rủi ro) (mặc định 15m 1h 4h 1d)`\n"
             "*/smc [pair] [tf...]:* `Không tham số: báo cáo khung "
-            f"{SMC_QUICK_TIMEFRAME} cho {', '.join(SMC_QUICK_BASES)}. "
+            f"{' + '.join(self._smc_quick_timeframes(self._rpc._freqtrade))} "
+            f"(theo khung của bot này) cho {', '.join(SMC_QUICK_BASES)}. "
             "Có tham số: giống /analysis`\n"
             "*/scalp [pair] [tf...]:* `Lệnh trong ngày — "
             f"{' + '.join(SMC_SCALP_TIMEFRAMES)} (bias {SMC_SCALP_TIMEFRAMES[-1]}, "

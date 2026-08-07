@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Đóng gói bot SMC 4h thành image, đẩy lên registry để server chỉ việc pull.
+# Đóng gói CẢ HAI bot SMC (4h swing + 5m scalping) vào MỘT image, đẩy lên registry để server
+# chỉ việc pull. Hai bot khác nhau ở lớp config lúc chạy, không phải ở image.
 # Runbook: docs/docker-smc.md §7.
 #
 # Usage:
@@ -34,8 +35,8 @@ require_registry() {
 }
 
 # Tag: thời gian trước để sort được, kèm commit để truy ngược mã nguồn. `-dirty` là quan trọng —
-# config.json và config-4h.json KHÔNG nằm trong git (.gitignore chặn config*.json), nên riêng
-# commit hash không định danh đủ nội dung image.
+# config.json, config-4h.json và config-5m.json KHÔNG nằm trong git (.gitignore chặn
+# config*.json), nên riêng commit hash không định danh đủ nội dung image.
 image_tag() {
     local sha dirty=""
     sha="$(git rev-parse --short HEAD 2>/dev/null || echo nogit)"
@@ -47,7 +48,8 @@ image_tag() {
 # rồi container crash-loop lúc khởi động — chặn ngay ở đây rẻ hơn nhiều.
 preflight() {
     docker info >/dev/null 2>&1 || die "Docker daemon chưa chạy (colima start / mở Docker Desktop)"
-    for f in config.json config-4h.json docker/smc-overrides.json "$DOCKERFILE"; do
+    for f in config.json config-4h.json config-5m.json \
+             docker/smc-overrides.json docker/smc-5m-overrides.json "$DOCKERFILE"; do
         [[ -f "$f" ]] || die "thiếu $f"
     done
 }
@@ -63,7 +65,8 @@ case "${1:-}" in
 build)
     preflight
     docker buildx build --load -f "$DOCKERFILE" -t "${IMAGE_NAME}:local" .
-    echo "OK: ${IMAGE_NAME}:local — thử bằng: docker compose -f docker-compose.smc.yml up -d"
+    echo "OK: ${IMAGE_NAME}:local (chạy được cả bot 4h lẫn 5m)"
+    echo "    thử bằng: docker compose -f docker-compose.smc.yml up -d"
     ;;
 
 push)
@@ -118,15 +121,19 @@ server)
 # ---- Chạy trên SERVER (một lần) --------------------------------------------
 mkdir -p ~/freqtrade-smc/user_data/logs && cd ~/freqtrade-smc
 # copy 2 file này từ máy build sang: ${COMPOSE_DEPLOY} và .env
+# .env PHẢI có BOT_5M_TG_TOKEN (token Telegram riêng của bot 5m) — thiếu thì compose
+# dừng ngay, vì dùng chung token với bot 4h sẽ gây 409 Conflict cho cả hai.
 # user trong container là uid 1000; user_data phải ghi được bởi uid đó:
 sudo chown -R 1000:1000 user_data
 docker login ${REGISTRY%%/*}
 
-# ---- Mỗi lần deploy --------------------------------------------------------
+# ---- Mỗi lần deploy (cả 2 bot: 4h + 5m) ------------------------------------
 # 1. sửa SMC_IMAGE trong .env thành tag mới
 docker compose -f ${COMPOSE_DEPLOY} pull
 docker compose -f ${COMPOSE_DEPLOY} up -d
 docker compose -f ${COMPOSE_DEPLOY} logs -f
+
+# Chỉ một bot: thêm tên service vào cuối (freqtrade-smc | freqtrade-smc-5m)
 
 # ---- Rollback --------------------------------------------------------------
 # đổi SMC_IMAGE về tag cũ rồi chạy lại 2 lệnh pull + up -d

@@ -3493,10 +3493,31 @@ def test__smc_quick_pairs():
     ]
 
 
+def test__smc_quick_timeframes(default_conf, mocker) -> None:
+    """/smc bám theo khung của bot, không cứng 4h — nếu không bot 5m trả kế hoạch swing 4h."""
+    _telegram, freqtradebot, _msg_mock = get_telegram_testobject(mocker, default_conf)
+
+    # Bot swing: đúng một khung của chính nó.
+    freqtradebot.strategy.timeframe = "4h"
+    assert Telegram._smc_quick_timeframes(freqtradebot) == ["4h"]
+    freqtradebot.strategy.timeframe = "1h"
+    assert Telegram._smc_quick_timeframes(freqtradebot) == ["1h"]
+
+    # Bot scalping (< 1h): cả bộ scalp, thấp -> cao. Một khung duy nhất sẽ khiến
+    # _smc_signal_report lấy bias ngay trên khung vào lệnh.
+    freqtradebot.strategy.timeframe = "5m"
+    assert Telegram._smc_quick_timeframes(freqtradebot) == ["5m", "15m"]
+
+    # Không đọc được khung -> dự phòng, không được ném lỗi (/help cũng gọi hàm này).
+    freqtradebot.strategy.timeframe = MagicMock()
+    assert Telegram._smc_quick_timeframes(freqtradebot) == ["4h"]
+
+
 async def test_smc_quick_handle(default_conf, update, mocker) -> None:
     telegram, freqtradebot, msg_mock = get_telegram_testobject(mocker, default_conf)
     freqtradebot.config["stake_currency"] = "USDT"
     freqtradebot.active_pair_whitelist = ["BTC/USDT", "ETH/USDT"]
+    freqtradebot.strategy.timeframe = "4h"
     report_mock = mocker.patch.object(
         telegram, "_build_analysis_report", AsyncMock(return_value="report")
     )
@@ -3515,6 +3536,15 @@ async def test_smc_quick_handle(default_conf, update, mocker) -> None:
         "SOL/USDT",
     ]
     assert all(c[0][2] == ["4h"] for c in report_mock.call_args_list)
+
+    # Cùng lệnh /smc trên bot 5m -> khung scalp, không phải 4h của bot swing.
+    msg_mock.reset_mock()
+    report_mock.reset_mock()
+    freqtradebot.strategy.timeframe = "5m"
+    await telegram._smc(update=update, context=context)
+    assert "5m + 15m" in msg_mock.call_args_list[0][0][0]
+    assert all(c[0][2] == ["5m", "15m"] for c in report_mock.call_args_list)
+    freqtradebot.strategy.timeframe = "4h"
 
     # Một cặp lỗi không được chặn các cặp còn lại — vẫn đủ 4 tin nhắn sau header.
     msg_mock.reset_mock()

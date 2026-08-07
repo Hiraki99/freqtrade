@@ -1,48 +1,66 @@
 ---
-# SMC 4h bot (SmcElliottStrategy) — the Docker equivalent of `./run_smc.sh` with no arguments.
-# Runbook: docs/docker-smc.md
+# Hai bot SMC chạy bằng Docker — tương đương `./run_smc.sh` và `./run_smc_5.sh` khi gọi
+# không tham số. Runbook: docs/docker-smc.md
 #
-#   docker compose -f docker-compose.smc.yml up -d --build
+#   docker compose -f docker-compose.smc.yml up -d --build          # cả hai bot
+#   docker compose -f docker-compose.smc.yml up -d --build freqtrade-smc      # chỉ 4h
+#   docker compose -f docker-compose.smc.yml up -d --build freqtrade-smc-5m   # chỉ 5m
 #
-# Do not run this while ./run_smc.sh is active on the host: both would use the same Telegram
-# token (409 Conflict) and compete for port 8091.
+# Đừng chạy song song với ./run_smc.sh hay ./run_smc_5.sh trên host: cùng token Telegram
+# (409 Conflict) và tranh cổng 8091 / 8082.
+#
 # Explicit project name. Without it Compose derives it from the directory and shares a namespace
 # with the repo's own docker-compose.yml, where `down --remove-orphans` from either file would
 # delete the other's containers.
 name: freqtrade-smc
 
+# Phần dùng chung của hai bot. Chúng khác nhau đúng 5 thứ: tên container, lớp config, cổng,
+# logfile và token Telegram — mọi thứ còn lại giống hệt, nên tách ra anchor để hai service
+# không thể lệch nhau một cách âm thầm.
+x-smc-common: &smc-common
+  build:
+    context: .
+    dockerfile: docker/Dockerfile.smc
+  # Cùng một image cho cả hai bot: chung strategy, chung package freqtrade, chỉ khác tham số
+  # lúc chạy. Build lần hai là cache hit nên gần như tức thì.
+  image: freqtrade-smc:local
+  restart: unless-stopped
+  # freqtrade handles SIGTERM, but as PID 1 that only holds while every code path keeps its
+  # handler installed. init: true guarantees the signal is delivered and reaps subprocesses.
+  init: true
+  # Telegram token and exchange key/secret come from .env at runtime — they are empty in
+  # config.json. api_server.password and jwt_secret_key are NOT: they are baked from
+  # config.json, and .env should override them via FREQTRADE__API_SERVER__*.
+  env_file:
+    - .env
+  volumes:
+    # Trade DB, logs and downloaded candles must outlive `docker compose down`.
+    # Strategies and configs are baked into the image, not mounted — rebuild to change them.
+    # Hai container dùng chung thư mục này nhưng KHÁC file DB và khác file log.
+    - "./user_data:/freqtrade/user_data"
+  # Give freqtrade room to cancel open orders and close the exchange connection cleanly.
+  stop_grace_period: 30s
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
 services:
+  # ---------------------------------------------------------------- 4h swing --
   freqtrade-smc:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.smc
-    image: freqtrade-smc:local
+    <<: *smc-common
     container_name: freqtrade-smc-4h
     # container_name only prevents a second container of this name. It does NOT stop
     # ./run_smc.sh on the host — pgrep and Docker cannot see each other. Stopping the host bot
     # before `up` remains a manual step (docs/docker-smc.md §1).
-    restart: unless-stopped
-    # freqtrade handles SIGTERM, but as PID 1 that only holds while every code path keeps its
-    # handler installed. init: true guarantees the signal is delivered and reaps subprocesses.
-    init: true
-    # Telegram token and exchange key/secret come from .env at runtime — they are empty in
-    # config.json. api_server.password and jwt_secret_key are NOT: they are baked from
-    # config.json, and .env should override them via FREQTRADE__API_SERVER__*.
-    env_file:
-      - .env
     environment:
       # Affects log timestamps only. The /analysis scheduler reads its zone from
       # config-4h.json telegram.analysis_schedule.timezone, independently of TZ.
       TZ: UTC
-    volumes:
-      # Trade DB, logs and downloaded candles must outlive `docker compose down`.
-      # Strategies and configs are baked into the image, not mounted — rebuild to change them.
-      - "./user_data:/freqtrade/user_data"
     ports:
       # Host-side loopback only. Reachable at http://127.0.0.1:8091 from this machine.
       - "127.0.0.1:8091:8091"
-    # Give freqtrade room to cancel open orders and close the exchange connection cleanly.
-    stop_grace_period: 30s
     healthcheck:
       # /api/v1/ping is the only unauthenticated endpoint.
       # Visibility only: Docker Engine does NOT restart an unhealthy container, and nothing here
@@ -53,8 +71,40 @@ services:
       timeout: 10s
       retries: 3
       start_period: 90s
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+
+  # -------------------------------------------------------------- 5m scalping --
+  freqtrade-smc-5m:
+    <<: *smc-common
+    container_name: freqtrade-smc-5m
+    environment:
+      TZ: UTC
+      # Token PHẢI khác bot 4h. Hai tiến trình cùng token -> Telegram trả 409 Conflict và CẢ HAI
+      # bot mất thông báo. env_file nạp FREQTRADE__TELEGRAM__TOKEN (token 4h) vào mọi container,
+      # nên dòng này bắt buộc phải có để đè lại — `environment` thắng `env_file`.
+      # Dạng `:?` làm compose báo lỗi ngay khi BOT_5M_TG_TOKEN trống, thay vì để bot khởi động
+      # rồi im lặng cướp token của bot 4h.
+      FREQTRADE__TELEGRAM__TOKEN: ${BOT_5M_TG_TOKEN:?dat BOT_5M_TG_TOKEN trong .env - token rieng cho bot 5m, tao o @BotFather}
+    ports:
+      - "127.0.0.1:8082:8082"
+    # Ghi đè CMD của image (mặc định là bot 4h). Config deep-merge trái sang phải, nên
+    # smc-5m-overrides.json thắng ở db_url và api_server.
+    command:
+      - trade
+      - --strategy
+      - SmcElliottStrategy
+      - --strategy-path
+      - /freqtrade/strategies
+      - --config
+      - /freqtrade/config.json
+      - --config
+      - /freqtrade/config-5m.json
+      - --config
+      - /freqtrade/docker/smc-5m-overrides.json
+      - --logfile
+      - /freqtrade/user_data/logs/smc-5m.log
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8082/api/v1/ping"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 90s

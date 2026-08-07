@@ -1,14 +1,28 @@
-# Chạy bot SMC 4h bằng Docker
+# Chạy hai bot SMC (4h + 5m) bằng Docker
 
-Tương đương với `./run_smc.sh` khi gọi **không tham số**: bot `smc-4h` chạy `SmcElliottStrategy`
-trên `config.json` + `config-4h.json`.
+Tương đương với `./run_smc.sh` và `./run_smc_5.sh` khi gọi **không tham số**. Cả hai chạy cùng một
+`SmcElliottStrategy`, khác nhau ở lớp config:
+
+| Bot | Service | Config | Cổng API | Log | Database |
+|---|---|---|---|---|---|
+| 4h swing | `freqtrade-smc` | `config.json` + `config-4h.json` + `docker/smc-overrides.json` | 8091 | `user_data/logs/smc-4h.log` | `tradesv3.4h-futures.sqlite` |
+| 5m scalping | `freqtrade-smc-5m` | `config.json` + `config-5m.json` + `docker/smc-5m-overrides.json` | 8082 | `user_data/logs/smc-5m.log` | `tradesv3.5m-futures.sqlite` |
 
 | Thành phần | File |
 |---|---|
-| Image | `docker/Dockerfile.smc` |
+| Image (dùng chung cho cả hai bot) | `docker/Dockerfile.smc` |
 | Ignore riêng cho build | `docker/Dockerfile.smc.dockerignore` |
-| Lớp config đè cuối | `docker/smc-overrides.json` |
-| Service | `docker-compose.smc.yml` |
+| Compose — build tại chỗ | `docker-compose.smc.yml` |
+| Compose — server pull từ registry | `docker-compose.smc.deploy.yml` |
+
+**Một image, hai container.** Hai bot chung strategy và chung package `freqtrade/`, chỉ khác tham
+số dòng lệnh. Image thứ hai chỉ nhân đôi ~1 GB layer và mở đường cho hai bot chạy lệch phiên bản
+mà không ai biết. Bot 5m ghi đè `CMD` của image bằng `command:` trong compose.
+
+**Token Telegram phải khác nhau.** Bot 4h dùng `FREQTRADE__TELEGRAM__TOKEN`, bot 5m dùng
+`BOT_5M_TG_TOKEN` — hai container chung một token thì Telegram trả **409 Conflict** và *cả hai*
+mất thông báo. Compose khai báo `${BOT_5M_TG_TOKEN:?...}` nên để trống thì `up` dừng ngay, thay vì
+để hỏng âm thầm.
 
 Không thể dùng image `freqtradeorg/freqtrade` — `freqtrade/rpc/telegram.py` trong repo này đã sửa
 riêng để thêm lệnh `/analysis` và `/smc`, nên image bắt buộc phải build từ source của repo.
@@ -38,70 +52,95 @@ docker --version && docker compose version
 
 ### 1.2 Các file bắt buộc phải có sẵn
 
-`.gitignore` chặn `config*.json`, nên **`config.json` và `config-4h.json` không nằm trong git**.
-Chúng được bake vào image từ working tree của máy đang build. Clone mới sẽ không có hai file này —
-build vẫn chạy qua nhưng container sẽ chết ngay lúc khởi động.
+`.gitignore` chặn `config*.json`, nên **`config.json`, `config-4h.json` và `config-5m.json` không
+nằm trong git**. Chúng được bake vào image từ working tree của máy đang build. Clone mới sẽ không
+có ba file này — build vẫn chạy qua nhưng container sẽ chết ngay lúc khởi động.
 
 ```bash
-ls config.json config-4h.json      # cả hai phải tồn tại
-cp .env.example .env               # rồi điền FREQTRADE__TELEGRAM__TOKEN và CHAT_ID
+ls config.json config-4h.json config-5m.json   # cả ba phải tồn tại
+cp .env.example .env                           # rồi điền các token bên dưới
 mkdir -p user_data/logs
+```
+
+Trong `.env` cần **ba** giá trị Telegram (bỏ qua nếu không dùng Telegram — xem §6):
+
+```
+FREQTRADE__TELEGRAM__TOKEN=<token bot 4h>
+FREQTRADE__TELEGRAM__CHAT_ID=<chat id, dùng chung cho cả hai bot>
+BOT_5M_TG_TOKEN=<token bot 5m — bot KHÁC ở @BotFather>
 ```
 
 ### 1.3 Chuyển database trade sang user_data/ — làm một lần
 
-Bot chạy trên host dùng `db_url` tương đối trong `config-4h.json`, nên file DB nằm ở **gốc repo**.
-Container dùng đường dẫn tuyệt đối trong `user_data/`. Đây là **hai file khác nhau**: nếu bỏ qua
-bước này, container khởi động với DB rỗng, không biết gì về lệnh đang mở — sẽ không quản lý
-stoploss/exit cho chúng và có thể vào lại đúng cặp đó.
+Bot chạy trên host dùng `db_url` tương đối trong `config-4h.json` / `config-5m.json`, nên file DB
+nằm ở **gốc repo**. Container dùng đường dẫn tuyệt đối trong `user_data/`. Đây là **hai file khác
+nhau**: nếu bỏ qua bước này, container khởi động với DB rỗng, không biết gì về lệnh đang mở — sẽ
+không quản lý stoploss/exit cho chúng và có thể vào lại đúng cặp đó.
 
 ```bash
 # Dừng bot host TRƯỚC khi copy (để SQLite flush -wal), rồi:
-cp tradesv3.4h.sqlite* user_data/
+cp tradesv3.4h-futures.sqlite* user_data/    # bot 4h
+cp tradesv3.5m-futures.sqlite* user_data/    # bot 5m
 ```
+
+Tên file trong container giữ **đúng như bản host**, nên copy sang là dùng được ngay, không cần
+đổi tên. `tradesv3.5m.sqlite` (thời còn chạy spot) không liên quan — để nguyên mà tra cứu.
 
 ### 1.4 Dừng bot host
 
-Nếu `./run_smc.sh` đang chạy, hai bot sẽ dùng chung một Telegram token (lỗi **409 Conflict**) và
-tranh cổng 8091. `container_name` **không** ngăn được việc này — `pgrep` và Docker không nhìn thấy
-nhau.
+Nếu `./run_smc.sh` hoặc `./run_smc_5.sh` đang chạy, bot host và container sẽ dùng chung một
+Telegram token (lỗi **409 Conflict**) và tranh cổng 8091 / 8082. `container_name` **không** ngăn
+được việc này — `pgrep` và Docker không nhìn thấy nhau.
 
 ```bash
 # Xem trước cái gì sẽ bị giết — pkill -f khớp toàn bộ command line, dễ bắn nhầm
 # editor, tail, hay chính lệnh docker logs đang mở.
 pgrep -af "freqtrade trade .*SmcElliottStrategy"
-# Rồi kill theo PID cụ thể, hoặc Ctrl+C ở terminal đang chạy run_smc.sh.
+# Rồi kill theo PID cụ thể, hoặc Ctrl+C ở terminal đang chạy run_smc.sh / run_smc_5.sh.
 ```
 
 ## 2. Build và chạy
 
 ```bash
+# Cả hai bot
 docker compose -f docker-compose.smc.yml up -d --build
+
+# Chỉ một bot — thêm tên service vào cuối
+docker compose -f docker-compose.smc.yml up -d --build freqtrade-smc       # 4h
+docker compose -f docker-compose.smc.yml up -d --build freqtrade-smc-5m    # 5m
 ```
 
-Lần build đầu mất vài phút (biên dịch `ta-lib`, `scipy`). Các lần sau dùng cache.
+Lần build đầu mất vài phút (biên dịch `ta-lib`, `scipy`). Các lần sau dùng cache. Hai service dùng
+chung tag `freqtrade-smc:local` nên chỉ build một lần thật; lượt thứ hai là cache hit.
 
 ## 3. Vận hành hằng ngày
 
+Không kèm tên service thì lệnh áp cho **cả hai** container.
+
 ```bash
-# Xem log trực tiếp
+# Xem log trực tiếp (cả hai bot, tiền tố là tên service)
 docker compose -f docker-compose.smc.yml logs -f
+docker compose -f docker-compose.smc.yml logs -f freqtrade-smc-5m   # chỉ bot 5m
 
 # Hoặc đọc file log (nằm trên host qua bind mount)
 tail -f user_data/logs/smc-4h.log
+tail -f user_data/logs/smc-5m.log
 
 # Trạng thái + healthcheck
 docker compose -f docker-compose.smc.yml ps
 
 # Khởi động lại
 docker compose -f docker-compose.smc.yml restart
+docker compose -f docker-compose.smc.yml restart freqtrade-smc-5m
 
 # Dừng hẳn (dữ liệu trade vẫn còn trong user_data/)
 docker compose -f docker-compose.smc.yml down
+docker compose -f docker-compose.smc.yml stop freqtrade-smc-5m      # tắt riêng bot 5m
 ```
 
-REST API: <http://127.0.0.1:8091> — chỉ mở trên loopback của host, không ra ngoài mạng.
-Tài khoản lấy từ `api_server.username` / `password` (xem §5 về việc đổi password).
+REST API: <http://127.0.0.1:8091> (4h) và <http://127.0.0.1:8082> (5m) — chỉ mở trên loopback của
+host, không ra ngoài mạng. Tài khoản lấy từ `api_server.username` / `password` (xem §5 về việc đổi
+password).
 
 > Healthcheck chỉ để **quan sát**. Docker Engine không tự khởi động lại container `unhealthy`, và
 > không có gì trong stack này đọc trạng thái đó. Thấy `unhealthy` thì vào xem log.
@@ -113,11 +152,17 @@ khi build lại:
 
 | Sửa file | Cần làm |
 |---|---|
-| `strategies/SmcElliottStrategy.py` | `up -d --build` |
-| `config.json`, `config-4h.json` | `up -d --build` |
+| `strategies/SmcElliottStrategy.py` | `up -d --build` — **ảnh hưởng CẢ HAI bot** |
+| `config.json` | `up -d --build` — **ảnh hưởng cả hai bot** |
+| `config-4h.json`, `docker/smc-overrides.json` | `up -d --build` (chỉ bot 4h đọc) |
+| `config-5m.json`, `docker/smc-5m-overrides.json` | `up -d --build` (chỉ bot 5m đọc) |
 | `freqtrade/rpc/telegram.py` (hoặc bất kỳ file nào trong `freqtrade/`) | `up -d --build` |
 | `.env` (token, key, password) | chỉ cần `restart` |
-| `docker/smc-overrides.json` | `up -d --build` |
+
+Vì hai bot chung một image, build lại là build lại cho **cả hai**. Sửa `config-5m.json` rồi
+`up -d --build` sẽ tạo image mới và tái tạo luôn container 4h — không mất trade (DB nằm ở
+`user_data/`), nhưng bot 4h sẽ khởi động lại. Muốn tránh thì `up -d --build freqtrade-smc-5m`,
+đổi lại là hai container tạm thời chạy hai image khác nhau cho tới lần build chung kế tiếp.
 
 ```bash
 docker compose -f docker-compose.smc.yml up -d --build
@@ -133,14 +178,16 @@ phụ thuộc `.venv` hay `./sync_strategies.sh`.
 
 ## 5. Cái gì nằm trong image, cái gì không
 
-**Bake vào image:** `strategies/`, `config.json`, `config-4h.json`, `docker/smc-overrides.json`,
-toàn bộ package `freqtrade/`.
+**Bake vào image:** `strategies/`, `config.json`, `config-4h.json`, `config-5m.json`,
+`docker/smc-overrides.json`, `docker/smc-5m-overrides.json`, toàn bộ package `freqtrade/`.
 
 **Nạp lúc chạy qua `env_file: .env`:**
 
 | Secret | Trạng thái |
 |---|---|
-| `telegram.token`, `telegram.chat_id` | Rỗng trong `config.json` → **không bị bake**, lấy từ `.env` |
+| `telegram.token` (bot 4h) | Rỗng trong `config.json` → **không bị bake**, lấy từ `.env` |
+| `telegram.token` (bot 5m) | Lấy từ `BOT_5M_TG_TOKEN` trong `.env`, compose ánh xạ sang `FREQTRADE__TELEGRAM__TOKEN` cho riêng container 5m |
+| `telegram.chat_id` | Rỗng trong `config.json` → **không bị bake**, dùng chung cho cả hai bot |
 | `exchange.key`, `exchange.secret` | Rỗng trong `config.json` → **không bị bake**, lấy từ `.env` |
 | `api_server.password` | **Có giá trị trong `config.json` → BỊ BAKE** |
 | `api_server.jwt_secret_key` | **Có giá trị trong `config.json` → BỊ BAKE** |
@@ -155,13 +202,16 @@ FREQTRADE__API_SERVER__JWT_SECRET_KEY=<chuỗi ngẫu nhiên mới>
 
 **Bind mount:** `user_data/` — DB SQLite, log, dữ liệu nến tải về đều sống sót qua `down`.
 
-`docker/smc-overrides.json` là lớp config cuối cùng, sửa đúng hai thứ mà bản chạy host không cần:
+`docker/smc-overrides.json` (4h) và `docker/smc-5m-overrides.json` (5m) là lớp config cuối cùng,
+mỗi file sửa đúng hai thứ mà bản chạy host không cần:
 
 - `db_url` thành đường dẫn tuyệt đối trong `user_data/` (bản gốc là đường dẫn tương đối, sẽ rơi vào
   `/freqtrade` — không phải volume — và mất sạch trade khi xoá container). Xem §1.3.
 - `api_server.listen_ip_address` thành `0.0.0.0` (bản gốc `127.0.0.1` trong container nghĩa là chỉ
   loopback của container, cổng publish sẽ không truy cập được). An toàn vì compose chỉ publish ra
   `127.0.0.1` của host.
+
+Cổng vẫn giữ nguyên như bản host (8091 và 8082) để không phải nhớ hai bộ số.
 
 ## 6. Xử lý sự cố
 
@@ -175,14 +225,32 @@ riêng (`freqtrade/rpc/telegram.py:253`), nên token rỗng hoặc sai chỉ gi�
 điền. Kiểm tra bằng cách tìm dòng token trong log:
 
 ```bash
-docker compose -f docker-compose.smc.yml logs | grep -i "telegram\|InvalidToken"
+docker compose -f docker-compose.smc.yml logs | grep -i "telegram\|InvalidToken\|Conflict"
 ```
 
 Nếu cố ý không dùng Telegram, thêm vào `.env` để tắt hẳn cho rõ ràng:
 
 ```
 FREQTRADE__TELEGRAM__ENABLED=false
+BOT_5M_TG_TOKEN=disabled          # vẫn phải có giá trị, nếu không compose từ chối chạy
 ```
+
+### `Conflict: terminated by other getUpdates request`
+
+Hai tiến trình đang dùng **cùng một token**. Trong 409 Conflict, Telegram chỉ phục vụ một bên và
+bên kia mất sạch thông báo — nhưng cả hai bot vẫn giao dịch bình thường và healthcheck vẫn xanh.
+
+Thủ phạm thường gặp, theo thứ tự:
+
+1. `BOT_5M_TG_TOKEN` được đặt bằng đúng token của bot 4h. Kiểm chứng bằng cách so hai giá trị đã
+   phân giải — hai dòng phải khác nhau:
+
+   ```bash
+   docker compose -f docker-compose.smc.yml config | grep -A1 FREQTRADE__TELEGRAM__TOKEN
+   ```
+
+2. Bot host (`./run_smc.sh` / `./run_smc_5.sh`) vẫn chạy song song với container. Xem §1.4.
+3. Container cũ từ lần `up` trước chưa chết: `docker ps -a | grep freqtrade-smc`.
 
 ### Container restart liên tục
 
@@ -249,7 +317,12 @@ lạ — chỉ WebSocket upgrade mới bị 403. Dễ tưởng là lỗi phía M
 lsof -nP -iTCP:8081 -sTCP:LISTEN
 ```
 
-Đã dời sang 8091 ngày 2026-08-05. **Đừng đẩy về 8081.** Bot 5m vẫn ở 8080 (`config.json`).
+Đã dời sang 8091 ngày 2026-08-05. **Đừng đẩy về 8081.** Bot 5m ở 8082 (`config-5m.json`), cũng
+không đụng Metro.
+
+### `bind: address already in use` ở cổng 8082
+
+Bot 5m host (`./run_smc_5.sh`) vẫn đang chạy. Xem §1.4.
 
 ### Giá trị trong `.env` có ký tự `$`
 
@@ -263,9 +336,12 @@ docker compose -f docker-compose.smc.yml run --rm freqtrade-smc env | grep FREQT
 
 ## 7. Deploy lên server qua registry
 
-Máy Mac build image → đẩy lên registry → server pull về chạy. Server **không cần clone repo**:
-strategy và config đã bake trong image, server chỉ cần hai file là `docker-compose.smc.deploy.yml`
-và `.env`.
+Máy Mac build image → đẩy lên registry → server pull về chạy **cả hai bot**. Server **không cần
+clone repo**: strategy và config đã bake trong image, server chỉ cần hai file là
+`docker-compose.smc.deploy.yml` và `.env`.
+
+Một image chở cả hai bot, nên deploy là nguyên tử: `pull` + `up -d` đưa 4h và 5m lên cùng một bản,
+và rollback cũng kéo cả hai về cùng một bản. Không có cửa cho hai bot lệch phiên bản strategy.
 
 | Thành phần | File |
 |---|---|
@@ -354,7 +430,10 @@ scp .env user@server:~/freqtrade-smc/          # rồi SỬA lại trên server,
 
 - **bỏ** các biến `SMC_REGISTRY*`, `SMC_PLATFORM` — chỉ máy build cần;
 - **thêm** `SMC_IMAGE=ghcr.io/<ns>/freqtrade-smc:<tag>` — ghim tag cụ thể mà `push` vừa in ra;
-- **đổi** `FREQTRADE__API_SERVER__PASSWORD` và `FREQTRADE__API_SERVER__JWT_SECRET_KEY`.
+- **đổi** `FREQTRADE__API_SERVER__PASSWORD` và `FREQTRADE__API_SERVER__JWT_SECRET_KEY`;
+- **giữ** `FREQTRADE__TELEGRAM__TOKEN` và `BOT_5M_TG_TOKEN` — thiếu `BOT_5M_TG_TOKEN` thì compose
+  từ chối chạy. Nếu bot host ở máy cũ vẫn đang bật, hai token này đang bị dùng ở đó: tắt bot cũ
+  trước, nếu không server và máy cũ sẽ 409 Conflict lẫn nhau.
 
 Container chạy bằng uid 1000, thư mục bind mount phải ghi được bởi uid đó:
 
@@ -367,7 +446,8 @@ docker login ghcr.io
 flush `-wal` (cùng lý do §1.3):
 
 ```bash
-scp user_data/tradesv3.4h.sqlite* user@server:~/freqtrade-smc/user_data/
+scp user_data/tradesv3.4h-futures.sqlite* user@server:~/freqtrade-smc/user_data/
+scp user_data/tradesv3.5m-futures.sqlite* user@server:~/freqtrade-smc/user_data/
 ```
 
 ### 7.5 Mỗi lần deploy
@@ -390,17 +470,19 @@ vì `latest` — `latest` không rollback được vì không biết nó từng 
 ### 7.6 Kiểm tra sau deploy
 
 ```bash
-docker compose -f docker-compose.smc.deploy.yml ps        # healthy sau ~90s
-curl -fsS http://127.0.0.1:8091/api/v1/ping               # trên server
+docker compose -f docker-compose.smc.deploy.yml ps        # CẢ HAI healthy sau ~90s
+curl -fsS http://127.0.0.1:8091/api/v1/ping               # bot 4h, trên server
+curl -fsS http://127.0.0.1:8082/api/v1/ping               # bot 5m, trên server
 ```
 
-Và quan trọng nhất: gõ `/smc` trong Telegram. Healthcheck chỉ chạm REST API — Telegram chết mà
-container vẫn "healthy" (§6).
+Và quan trọng nhất: gõ `/smc` trong Telegram **ở cả hai bot**. Healthcheck chỉ chạm REST API —
+Telegram chết, hoặc hai bot đang 409 Conflict lẫn nhau, mà container vẫn "healthy" (§6).
 
 Xem FreqUI từ máy nhà (cổng chỉ mở loopback trên server):
 
 ```bash
-ssh -L 8091:127.0.0.1:8091 user@server    # rồi mở http://127.0.0.1:8091
+ssh -L 8091:127.0.0.1:8091 -L 8082:127.0.0.1:8082 user@server
+# rồi mở http://127.0.0.1:8091 (4h) và http://127.0.0.1:8082 (5m)
 ```
 
 ### 7.7 Không muốn dùng registry
@@ -421,6 +503,7 @@ Backtesting, hyperopt và lookahead-analysis **chưa** được đóng gói. V�
 ```bash
 ./run_smc.sh backtesting --timerange 20260101-
 ./run_smc.sh hyperopt --hyperopt-loss SharpeHyperOptLoss --epochs 100
+./run_smc_5.sh backtesting --timerange 20260701-   # khung 5m
 ```
 
 Bot ICT (`./run_ict_m5.sh`) cũng chưa có bản Docker.
