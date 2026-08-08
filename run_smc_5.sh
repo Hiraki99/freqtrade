@@ -23,6 +23,11 @@ CONFIG="config.json"
 OVERRIDE="config-5m.json"
 BOT_NAME="smc-5m"
 TOKEN_VAR="BOT_5M_TG_TOKEN"
+# Kênh nhận tin của bot 5m. Trống -> dùng chung chat_id với bot 4h.
+# Dùng chung KHÔNG gây lỗi như dùng chung token: hai bot khác nhau nhắn cùng một người vẫn
+# là hai cuộc trò chuyện riêng trong Telegram. Biến này chỉ cần khi muốn đẩy bot 5m sang
+# một group/channel khác hẳn.
+CHAT_VAR="BOT_5M_TG_CHAT_ID"
 
 # Nạp secrets/token từ .env
 if [[ -f .env ]]; then set -a; source .env; set +a; fi
@@ -82,7 +87,14 @@ if [[ -z "$TOKEN" ]]; then
     echo "   Tạo bot mới ở @BotFather rồi đặt ${TOKEN_VAR}=... — KHÔNG dùng lại token bot 4h."
 fi
 
+CHAT_ID="${!CHAT_VAR:-${FREQTRADE__TELEGRAM__CHAT_ID:-}}"
+
 echo "→ Khởi động ${BOT_NAME} (config: ${CONFIG} + ${OVERRIDE})"
+if [[ -n "${!CHAT_VAR:-}" ]]; then
+    echo "   Telegram: kênh riêng (${CHAT_VAR})"
+else
+    echo "   Telegram: chung chat_id với bot 4h (đặt ${CHAT_VAR} để tách kênh)"
+fi
 echo "   log=user_data/logs/${BOT_NAME}.log   Ctrl+C để dừng."
 
 # exec: script biến mất, freqtrade thành tiến trình chính -> Ctrl+C và SIGHUP
@@ -90,7 +102,7 @@ echo "   log=user_data/logs/${BOT_NAME}.log   Ctrl+C để dừng."
 exec env \
     FREQTRADE__TELEGRAM__ENABLED="$TG_ENABLED" \
     FREQTRADE__TELEGRAM__TOKEN="$TOKEN" \
-    FREQTRADE__TELEGRAM__CHAT_ID="${FREQTRADE__TELEGRAM__CHAT_ID:-}" \
+    FREQTRADE__TELEGRAM__CHAT_ID="$CHAT_ID" \
     "$FT" trade \
         --strategy "$STRAT" \
         --strategy-path "$STRAT_PATH" \

@@ -24,6 +24,11 @@ mà không ai biết. Bot 5m ghi đè `CMD` của image bằng `command:` trong 
 mất thông báo. Compose khai báo `${BOT_5M_TG_TOKEN:?...}` nên để trống thì `up` dừng ngay, thay vì
 để hỏng âm thầm.
 
+**Chat_id thì không bắt buộc tách.** `token` là danh tính *bot*, `chat_id` là *nơi nhận* — hai
+bot khác nhau nhắn cùng một người vẫn hiện thành hai cuộc trò chuyện riêng trong Telegram, nên
+dùng chung `chat_id` không hỏng gì. Muốn bot 5m đổ vào group/channel khác hẳn thì đặt
+`BOT_5M_TG_CHAT_ID` (id group là số **âm**); để trống thì rơi về `chat_id` chung.
+
 Không thể dùng image `freqtradeorg/freqtrade` — `freqtrade/rpc/telegram.py` trong repo này đã sửa
 riêng để thêm lệnh `/analysis` và `/smc`, nên image bắt buộc phải build từ source của repo.
 
@@ -68,6 +73,7 @@ Trong `.env` cần **ba** giá trị Telegram (bỏ qua nếu không dùng Teleg
 FREQTRADE__TELEGRAM__TOKEN=<token bot 4h>
 FREQTRADE__TELEGRAM__CHAT_ID=<chat id, dùng chung cho cả hai bot>
 BOT_5M_TG_TOKEN=<token bot 5m — bot KHÁC ở @BotFather>
+BOT_5M_TG_CHAT_ID=<tuỳ chọn — chỉ đặt khi muốn bot 5m nhắn vào group/channel riêng>
 ```
 
 ### 1.3 Chuyển database trade sang user_data/ — làm một lần

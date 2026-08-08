@@ -68,6 +68,9 @@ services:
       # thông báo. env_file nạp FREQTRADE__TELEGRAM__TOKEN (token 4h) vào mọi container nên
       # dòng này bắt buộc phải có để đè lại; `environment` thắng `env_file`.
       FREQTRADE__TELEGRAM__TOKEN: ${BOT_5M_TG_TOKEN:?dat BOT_5M_TG_TOKEN trong .env - token rieng cho bot 5m, tao o @BotFather}
+      # Trống -> dùng chung chat_id với bot 4h; hai bot khác nhau nhắn cùng một người vẫn là
+      # hai cuộc trò chuyện riêng. Đặt biến này khi muốn kênh/group riêng cho bot 5m.
+      FREQTRADE__TELEGRAM__CHAT_ID: ${BOT_5M_TG_CHAT_ID:-${FREQTRADE__TELEGRAM__CHAT_ID:-}}
     ports:
       #   ssh -L 8082:127.0.0.1:8082 user@server
       - "127.0.0.1:8082:8082"

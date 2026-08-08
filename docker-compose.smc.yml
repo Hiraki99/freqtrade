@@ -84,6 +84,11 @@ services:
       # Dạng `:?` làm compose báo lỗi ngay khi BOT_5M_TG_TOKEN trống, thay vì để bot khởi động
       # rồi im lặng cướp token của bot 4h.
       FREQTRADE__TELEGRAM__TOKEN: ${BOT_5M_TG_TOKEN:?dat BOT_5M_TG_TOKEN trong .env - token rieng cho bot 5m, tao o @BotFather}
+      # Kênh nhận tin. Trống -> rơi về chat_id chung của bot 4h, và đó là mặc định lành:
+      # hai bot KHÁC nhau nhắn cùng một người vẫn ra hai cuộc trò chuyện riêng trong
+      # Telegram. Chỉ cần đặt biến này khi muốn đẩy bot 5m sang group/channel khác hẳn.
+      # Không dùng `:?` như token: chat_id trùng nhau không gây 409 Conflict.
+      FREQTRADE__TELEGRAM__CHAT_ID: ${BOT_5M_TG_CHAT_ID:-${FREQTRADE__TELEGRAM__CHAT_ID:-}}
     ports:
       - "127.0.0.1:8082:8082"
     # Ghi đè CMD của image (mặc định là bot 4h). Config deep-merge trái sang phải, nên
