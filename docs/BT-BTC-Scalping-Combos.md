@@ -12,6 +12,10 @@
 > **Kết luận: cả 3 combo TRƯỢT BT-06 và BT-07, và không combo nào đánh bại được mốc
 > random-entry của BT-04(b).** Không combo nào nên đi tiếp sang BT-08 (paper trade).
 > Đây đúng là kịch bản mà RISK-06 đã dự báo.
+>
+> **Cập nhật §6 — đã thử RR 1:2 và nó KHÔNG cứu được combo nào.** Khuyến nghị "nâng RR"
+> ở §4.2 của chính báo cáo này đã bị kiểm định và **bác bỏ**. Xem §6 trước khi hành động
+> theo §4.
 
 ---
 
@@ -326,3 +330,124 @@ Hai config không vào git. Khoá quan trọng nếu phải dựng lại:
 Mọi cửa sổ thời gian trong code khai báo bằng **phút** rồi quy ra số nến theo
 `self.timeframe`, nên cùng một file chạy đúng ở cả 1m lẫn 5m — thêm `--timeframe 1m` là
 có bản sát đặc tả gốc của Combo A và C (SRS viết theo nến 1m).
+
+---
+
+## 6. Vòng 2 — thử RR 1:2 (2026-08-08, sau khi có §1–§5)
+
+§4.2 khuyến nghị nâng RR lên 1:2 vì ngưỡng hoà vốn RM-03 sẽ tụt từ ~57% xuống
+`(1 + f) / 3` ≈ **40%**, dưới winrate quan sát được của cả ba combo. Khuyến nghị đó đã
+được chạy. **Nó sai** — và lý do vì sao nó sai mới là phần đáng giữ lại.
+
+### 6.1. Thiết kế phép thử
+
+RR đổi thì kéo theo hai thứ, phải tách ra mới đọc được:
+
+- **G-07.** Timeout 45 phút vốn được đặt cho mục tiêu 1.15R. Dưới giả định bước ngẫu
+  nhiên, thời gian kỳ vọng để đi hết quãng đường `d` tỉ lệ `d²`, nên mục tiêu 2R cần
+  `(2/1.15)² ≈ 3.0` lần thời gian. Vì vậy mỗi combo chạy **hai** bản: giữ 45 phút
+  (cô lập đúng biến RR) và nới lên **135 phút** (để mục tiêu 2R thực sự với tới được).
+- **A-L5 của Combo A** đọc thẳng `self.rr`, nên nâng RR tự động siết bước này chặt hơn.
+  Số lệnh của A giảm 45 → 34 vì lý do khác hai combo kia.
+
+Mốc random-entry chạy lại toàn bộ ở RR 1:2 với timeout 135 phút, 5 seed mỗi nhóm.
+
+### 6.2. Kết quả
+
+Kỳ vọng **net** (R / lệnh) — số càng gần 0 càng đỡ tệ:
+
+| | RR 1:1.15 | RR 1:2, G-07 45' | RR 1:2, G-07 135' | **random RR 1:2** (5 seed) |
+|---|---|---|---|---|
+| Combo A | −0.126 | −0.101 | **−0.261** | −0.174 ± 0.339 |
+| Combo B | −0.304 | −0.296 | **−0.272** | −0.170 ± 0.157 |
+| Combo C | −0.224 | −0.220 | **−0.210** | −0.253 ± 0.026 |
+
+Profit factor và tổng lợi nhuận:
+
+| | RR 1:1.15 | RR 1:2, 45' | RR 1:2, 135' |
+|---|---|---|---|
+| Combo A | 0.70 / −2.78% | 0.77 / −1.72% | 0.59 / −4.33% |
+| Combo B | 0.58 / −8.23% | 0.63 / −7.65% | 0.69 / −7.21% |
+| Combo C | 0.61 / −29.52% | 0.64 / −29.03% | 0.70 / −27.79% |
+
+Winrate so với ngưỡng hoà vốn RM-03:
+
+| | RR 1:1.15 | RR 1:2, 135' |
+|---|---|---|
+| Combo A | 51.1% vs 56.0% (−4.9) | 29.4% vs 40.4% (−11.0) |
+| Combo B | 40.6% vs 57.1% (−16.5) | 29.5% vs 41.0% (−11.5) |
+| Combo C | 42.1% vs 56.8% (−14.7) | 36.2% vs 40.7% (−4.5) |
+
+### 6.3. Vì sao nâng RR không cứu được
+
+**Ngưỡng hoà vốn tụt đúng như dự đoán (57% → ~40.5%), nhưng winrate thực tụt nhanh
+không kém.** Combo B: 40.6% → 29.5%. Combo A: 51.1% → 29.4%. Khoảng cách tới ngưỡng có
+thu hẹp (B: 16.5 → 11.5 điểm; C: 14.7 → 4.5 điểm) nhưng không đóng lại.
+
+Lý do có dạng đóng. Với bước ngẫu nhiên không drift, stop ở 1R và mục tiêu ở `k`·R:
+
+```
+P(chạm mục tiêu trước stop) = 1 / (1 + k)
+```
+
+Ở `k = 2` công thức cho **33.3%**. Mốc random-entry đo được ở RR 1:2 (timeout 135' nên
+gần như mọi lệnh đều kết thúc bằng TP hoặc SL): **33.1%** (nhóm A), **33.8%** (nhóm B),
+35.7% (nhóm C). Khớp gần như hoàn hảo.
+
+Ba combo rơi vào: **29.4%** (A), **29.5%** (B), **36.2%** (C) — tức A và B nằm *dưới*
+đồng xu, C ngang bằng.
+
+Đây chính là điều §2.2 đã nói, giờ nhìn từ một góc khác: **entry của ba combo không dịch
+được xác suất chạm mục tiêu ra khỏi giá trị của bước ngẫu nhiên.** Đổi RR chỉ là trượt
+dọc theo đúng đường cong `1/(1+k)` đó — đổi tỉ lệ thắng/thua chứ không tạo ra edge. Phí
+thì vẫn nguyên ~0.2 R mỗi lệnh, nên kết quả vẫn âm ở mọi điểm trên đường cong.
+
+### 6.4. Hai điều phụ nhưng cần ghi lại
+
+**a) BT-07 như đang viết bị hỏng khi có timeout.** Bản `Combo A RR 1:2, G-07 45'` cho
+winrate 50.0% so với ngưỡng 40.4% — nhìn qua là **ĐẠT BT-07**, trong khi profit factor
+chỉ 0.77 và kỳ vọng −0.101 R. Nguyên nhân: 19/34 lệnh thoát bằng **timeout** với lãi
+trung bình +0.35 R, được đếm là "thắng" nhưng trả về xa 2R. Công thức RM-03 giả định mọi
+lệnh thắng trả đúng `rr`·R; có timeout thì giả định đó vỡ.
+
+> **Đề xuất sửa SRS:** BT-07 chỉ hợp lệ khi tỉ lệ thoát-bằng-timeout đủ nhỏ (< ~10%).
+> Ngoài ngưỡng đó phải dùng kỳ vọng R thay cho winrate. Hoặc bỏ hẳn winrate như chính
+> BT-06 đã làm.
+
+**b) Mốc random của Combo C ở RR 1:2 là control yếu.** Random-C có 62–73% lệnh thoát
+bằng timeout, còn Combo C chỉ 27%. Cascade đi nhanh nên lệnh của C kịp chạm TP/SL, lệnh
+random thì không. Combo C nhỉnh hơn control ~1.5 sd ở phần gross (+0.011 so với
+−0.033 ± 0.029) — **không đọc con số này là edge**, hai bên đang so hai phân phối thời
+gian nắm giữ khác nhau. Và dù sao C vẫn PF 0.70, −27.8%.
+
+### 6.5. Kết luận vòng 2
+
+Không combo nào cải thiện đủ để đổi kết luận. Bản khá nhất trong toàn bộ 10 cấu hình đã
+chạy là **Combo C @ RR 1:2, timeout 135'** với PF 0.70 và −27.79% — vẫn còn cách ngưỡng
+BT-06 (PF > 1.2) rất xa.
+
+**Khuyến nghị §4.2 (nâng RR) coi như đã đóng: đã thử, không hiệu quả.** Hai nhánh còn lại
+của §4.2 — nới `s` lên ≥1% và bỏ taker exit — vẫn chưa thử, nhưng §6.3 cho thấy cả hai
+cũng chỉ tác động vào `f`, mà `f` không phải chỗ hỏng: gross expectancy của cả ba combo
+đều ≈ 0 hoặc âm ở *cả hai* mức RR. Không có edge để bảo toàn thì giảm chi phí chỉ làm
+đường lỗ thoải hơn.
+
+Việc đáng làm tiếp theo, nếu vẫn muốn theo hướng này, là **quay lại khâu tín hiệu** —
+tìm một điều kiện vào lệnh đẩy được `P(chạm mục tiêu)` lên trên `1/(1+k)` một cách đo
+được — chứ không phải chỉnh thêm bất kỳ tham số nào của khung quản trị rủi ro.
+
+### 6.6. Tái lập vòng 2
+
+```bash
+freqtrade backtesting --config config-scalp-bt.json --timerange 20240101-20260807 \
+  --timeframe-detail 1m --strategy-list ComboARR2 ComboARR2T ComboBRR2 ComboBRR2T \
+    RandARR2_1 RandARR2_2 RandARR2_3 RandARR2_4 RandARR2_5 \
+    RandBRR2_1 RandBRR2_2 RandBRR2_3 RandBRR2_4 RandBRR2_5
+
+freqtrade backtesting --config config-scalp-bt.json --config config-scalp-bt-C.json \
+  --timerange 20240101-20260807 --timeframe-detail 1m \
+  --strategy-list ComboCRR2 ComboCRR2T RandCRR2_1 RandCRR2_2 RandCRR2_3 RandCRR2_4 RandCRR2_5
+```
+
+Tất cả nằm trong `strategies/ComboRR2.py` (lớp con mỏng của ba combo gốc, chỉ ghi đè
+`rr` và `timeout_minutes`).

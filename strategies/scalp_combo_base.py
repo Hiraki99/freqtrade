@@ -325,11 +325,14 @@ class ScalpComboBase(IStrategy):
         đối chiếu nó với bội số R sẽ chốt sớm gấp `leverage` lần.
         """
         _, tp = self._levels(pair, trade)
+        # Nhãn mang theo RR đang chạy: để cứng "tp_1.15R" thì biến thể RR khác sẽ dán
+        # nhãn sai lên chính con số vừa đổi, và bảng lý do thoát đọc thành vô nghĩa.
+        tag = f"tp_{self.rr.value:g}R"
         if trade.is_short:
             if current_rate <= tp:
-                return "tp_1.15R"
+                return tag
         elif current_rate >= tp:
-            return "tp_1.15R"
+            return tag
 
         held = current_time - trade.open_date_utc
         if held >= timedelta(minutes=self.timeout_minutes.value):  # G-07
