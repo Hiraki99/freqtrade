@@ -1154,19 +1154,38 @@ class Telegram(RPCHandler):
         if ind:
             line += f"\n     {ind}"
         # Các mức SMC để dựng kế hoạch Entry-Target.
-        levels = {
+        levels = self._smc_levels_from_row(r, df)
+        return line, (1 if sw > 0 else -1 if sw < 0 else 0), price, levels
+
+    @classmethod
+    def _smc_levels_from_row(cls, r, df) -> dict:
+        """Bóc các mức SMC từ MỘT hàng của dataframe đã phân tích.
+
+        Tách khỏi `_smc_tf_line` (vốn gắn liền với việc fetch nến live) để mô phỏng ngoại
+        tuyến chấm được đúng thứ mà bot chấm: cùng hàm, cùng khoá, nên kết quả mô phỏng và
+        kết quả chạy thật không thể lệch nhau vì một bên quên một mức nào đó.
+
+        :param r: một hàng đã qua populate_indicators + populate_entry_trend
+        :param df: dataframe chứa hàng đó, cắt tới đúng thời điểm cần chấm (dùng cho pivots)
+        """
+
+        def val(v):
+            return None if v is None or (isinstance(v, float) and v != v) else v
+
+        sw = val(r.get("swing_trend")) or 0
+        return {
             "internal_trend": val(r.get("internal_trend")) or 0,
             "swing_trend": sw,
             "enter_long": bool(val(r.get("enter_long"))),
             "enter_short": bool(val(r.get("enter_short"))),
-            "bull_ob_top": bt,
-            "bull_ob_bot": bb,
+            "bull_ob_top": val(r.get("bull_ob_top")),
+            "bull_ob_bot": val(r.get("bull_ob_bot")),
             "sw_bull_ob_top": val(r.get("sw_bull_ob_top")),
             "sw_bull_ob_bot": val(r.get("sw_bull_ob_bot")),
             "fvg_top": val(r.get("fvg_top")),
             "fvg_bot": val(r.get("fvg_bot")),
-            "swing_high": sh,
-            "swing_low": sl,
+            "swing_high": val(r.get("swing_high")),
+            "swing_low": val(r.get("swing_low")),
             # ATR dùng dựng dải entry khi không có OB/FVG nào (thay vì trả một điểm).
             "atr": val(r.get("atr")),
             "equilibrium": val(r.get("equilibrium")),
@@ -1179,7 +1198,7 @@ class Telegram(RPCHandler):
             "vp_vah": val(r.get("vp_vah")),
             "vp_val": val(r.get("vp_val")),
             # Chuỗi pivot gần nhất để ước lượng sóng Elliott.
-            "pivots": self._smc_extract_pivots(df),
+            "pivots": cls._smc_extract_pivots(df),
             # Chỉ báo tham khảo (cho phần Bằng chứng).
             "rsi": val(r.get("rsi")),
             "ema50": val(r.get("ema50")),
@@ -1188,7 +1207,6 @@ class Telegram(RPCHandler):
             "macd": val(r.get("macd")),
             "macdsignal": val(r.get("macdsignal")),
         }
-        return line, (1 if sw > 0 else -1 if sw < 0 else 0), price, levels
 
     @staticmethod
     def _smc_extract_pivots(df, n: int = 7) -> list[dict]:
