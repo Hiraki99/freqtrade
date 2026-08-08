@@ -2178,18 +2178,36 @@ class Telegram(RPCHandler):
         return text, decision
 
     @staticmethod
-    def _next_analysis_slot(now: datetime, interval_hours: int, day_start_hour: int) -> datetime:
-        """Thời điểm chạy /analysis kế tiếp: các mốc cách nhau `interval_hours`,
-        neo tại `day_start_hour` (vd 4h neo 7h -> 7,11,15,19,23,3)."""
-        interval = max(1, int(interval_hours))
-        day_start = int(day_start_hour) % 24
-        slots = sorted({(day_start + k * interval) % 24 for k in range(max(1, 24 // interval))})
-        base = now.replace(minute=0, second=0, microsecond=0)
-        for h in slots:
-            cand = base.replace(hour=h)
-            if cand > now:
-                return cand
-        return (base + timedelta(days=1)).replace(hour=slots[0])
+    def _next_analysis_slot(
+        now: datetime,
+        interval_hours: int,
+        day_start_hour: int,
+        interval_minutes: int | None = None,
+    ) -> datetime:
+        """Thời điểm chạy /analysis kế tiếp: các mốc cách đều nhau, neo tại `day_start_hour`.
+
+        `interval_minutes` (nếu có) THẮNG `interval_hours`, để bot scalping chạy dưới mức một
+        giờ — bot 5m đợi 60 phút một lần thì kèo đã đi mất trước lượt phân tích kế tiếp.
+
+        Tính bằng phút kể từ mốc neo thay vì dựng sẵn danh sách giờ trong ngày. Cách cũ
+        (`range(24 // interval)`) chỉ đúng khi chu kỳ chia hết cho 24: với 5h nó sinh
+        7,12,17,22 rồi nhảy về 7 hôm sau — khoảng trống 9 tiếng giữa hai lượt liền kề. Cách
+        này giữ khoảng cách đều tuyệt đối, đổi lại chuỗi mốc có thể trôi qua ngày khi chu kỳ
+        không chia hết cho 24h; với 15m/1h/4h thì hai cách cho kết quả y hệt.
+
+        :param now: thời điểm hiện tại (có timezone)
+        :param interval_hours: chu kỳ theo giờ, dùng khi không có `interval_minutes`
+        :param day_start_hour: giờ neo trong ngày
+        :param interval_minutes: chu kỳ theo phút, ưu tiên hơn `interval_hours`
+        :return: mốc kế tiếp, luôn LỚN HƠN `now` (đứng đúng mốc thì trả mốc sau, không lặp lại)
+        """
+        step = int(interval_minutes) if interval_minutes else int(interval_hours) * 60
+        step = max(1, step)
+        anchor = now.replace(hour=int(day_start_hour) % 24, minute=0, second=0, microsecond=0)
+        if anchor > now:
+            anchor -= timedelta(days=1)
+        elapsed = (now - anchor).total_seconds() / 60
+        return anchor + timedelta(minutes=(int(elapsed // step) + 1) * step)
 
     def _auto_entry_from_analysis(self, ft, pair: str, decision: dict) -> str | None:
         """Vào lệnh thật theo kế hoạch mà lịch /analysis vừa gửi. Chạy trong thread riêng.
@@ -2314,19 +2332,22 @@ class Telegram(RPCHandler):
         except Exception:
             tz = ZoneInfo("UTC")
         interval = int(cfg.get("interval_hours", 4))
+        # Chu kỳ dưới một giờ cho bot scalping. Thắng interval_hours khi có mặt.
+        interval_min = cfg.get("interval_minutes")
+        interval_min = int(interval_min) if interval_min else None
         day_start = int(cfg.get("day_start_hour", 7))
         # Trễ sau khi nến đóng để chắc chắn sàn đã chốt nến (tránh fetch hụt).
         offset = max(0, int(cfg.get("offset_seconds", 0)))
         logger.info(
-            "Lịch /analysis bật: mỗi %dh, neo %02d:00 (%s), trễ %ds.",
-            interval,
+            "Lịch /analysis bật: mỗi %s, neo %02d:00 (%s), trễ %ds.",
+            f"{interval_min}m" if interval_min else f"{interval}h",
             day_start,
             tz,
             offset,
         )
         while not self._shutdown_event.is_set():
             now = datetime.now(tz)
-            nxt = self._next_analysis_slot(now, interval, day_start)
+            nxt = self._next_analysis_slot(now, interval, day_start, interval_min)
             wait = max(1.0, (nxt - now).total_seconds() + offset)
             try:
                 await asyncio.wait_for(self._shutdown_event.wait(), timeout=wait)

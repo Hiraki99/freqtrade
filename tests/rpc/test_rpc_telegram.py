@@ -3638,6 +3638,31 @@ def test__next_analysis_slot():
     assert nxt3.hour == 11  # đúng 07:00 -> mốc kế tiếp, không lặp lại chính nó
 
 
+def test__next_analysis_slot_sub_hour():
+    """Chu kỳ theo PHÚT cho bot scalping — interval_minutes thắng interval_hours."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo("UTC")
+
+    def nxt(h, m, minutes):
+        return Telegram._next_analysis_slot(datetime(2026, 7, 1, h, m, tzinfo=tz), 1, 0, minutes)
+
+    # 15 phút, neo 00:00 -> :00 :15 :30 :45
+    assert (nxt(8, 7, 15).hour, nxt(8, 7, 15).minute) == (8, 15)
+    assert (nxt(8, 46, 15).hour, nxt(8, 46, 15).minute) == (9, 0)
+    # Đứng đúng mốc -> trả mốc SAU, không lặp lại chính nó (nếu không vòng lặp quay tít).
+    assert (nxt(8, 15, 15).hour, nxt(8, 15, 15).minute) == (8, 30)
+    # Qua nửa đêm.
+    assert nxt(23, 50, 15).day == 2 and nxt(23, 50, 15).hour == 0
+
+    # interval_minutes rỗng/0 -> rơi về interval_hours, không được thành chu kỳ 0 phút.
+    h1 = Telegram._next_analysis_slot(datetime(2026, 7, 1, 8, 30, tzinfo=tz), 1, 0, None)
+    assert (h1.hour, h1.minute) == (9, 0)
+    h2 = Telegram._next_analysis_slot(datetime(2026, 7, 1, 8, 30, tzinfo=tz), 1, 0, 0)
+    assert (h2.hour, h2.minute) == (9, 0)
+
+
 def test__smc_trade_decision_min_rr_per_bot(default_conf, mocker) -> None:
     """Ngưỡng R:R lấy theo từng bot: bot scalping hạ 1:1 vẫn vào, bot mặc định 1:2 thì BỎ LỆNH."""
     _telegram, freqtradebot, _msg = get_telegram_testobject(mocker, default_conf)
