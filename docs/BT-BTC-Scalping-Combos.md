@@ -14,8 +14,12 @@
 > Đây đúng là kịch bản mà RISK-06 đã dự báo.
 >
 > **Cập nhật §6 — đã thử RR 1:2 và nó KHÔNG cứu được combo nào.** Khuyến nghị "nâng RR"
-> ở §4.2 của chính báo cáo này đã bị kiểm định và **bác bỏ**. Xem §6 trước khi hành động
-> theo §4.
+> ở §4.2 của chính báo cáo này đã bị kiểm định và **bác bỏ**.
+>
+> **Cập nhật §7 — đã hyperopt cả RR lẫn tham số tới khi PnL dương.** Đạt: cả ba combo
+> dương trong cửa sổ fit, `ComboCOpt` dương +8.93% trên toàn kỳ. Nhưng gross expectancy
+> của **cả ba** lật dấu khi sang 12 tháng holdout. Đọc §7.4 trước khi dùng bất kỳ bộ
+> tham số nào.
 
 ---
 
@@ -451,3 +455,134 @@ freqtrade backtesting --config config-scalp-bt.json --config config-scalp-bt-C.j
 
 Tất cả nằm trong `strategies/ComboRR2.py` (lớp con mỏng của ba combo gốc, chỉ ghi đè
 `rr` và `timeout_minutes`).
+
+---
+
+## 7. Vòng 3 — hyperopt RR + tham số cho tới khi PnL dương (2026-08-08)
+
+Yêu cầu: *"tối ưu lại rr, các combo, đến khi pnl dương thì thôi"*. Đã làm, và **PnL dương
+đạt được ở cả ba combo trong cửa sổ fit** — Combo C còn dương cả trên toàn kỳ 31 tháng.
+Phần đáng đọc là điều gì xảy ra ở 12 tháng không tham gia fit.
+
+### 7.1. Thiết kế
+
+- **Fit** 2024-01-01 → 2025-08-01 (20 tháng). **Holdout** 2025-08-01 → 2026-08-07
+  (12 tháng), chốt tham số ở cuối vòng fit và không chạm vào nữa.
+- 7 tham số / combo: 4 tham số gốc + `rr` ∈ [0.6, 5.0] + `timeout_minutes` ∈ [15, 480]
+  + `min_stop_pct` ∈ [0.20, 2.50] (C thêm `max_stop_pct`). **Vi phạm BT-02 (tối đa 4)
+  có chủ đích**, vì yêu cầu là tối ưu cả RR.
+- 500 epoch / combo, Optuna, `--random-state 42`, spaces `buy sell`.
+
+**Hàm mục tiêu phải tự viết.** Chạy thử với `SharpeHyperOptLoss`, epoch "tốt nhất" là
+**3 lệnh, 3 thắng, Sharpe 7.26** — Sharpe/Sortino/Calmar đều không phạt cỡ mẫu nên một
+mẫu bé toàn thắng luôn thắng mọi cấu hình có thật. `user_data/hyperopts/
+ExpectancyTStatLoss.py` thay bằng **t-statistic của kỳ vọng mỗi lệnh**
+(`mean/std·√n`, sàn cứng 30 lệnh), vì t phạt cỡ mẫu đúng chiều.
+
+### 7.2. Tham số hyperopt chọn
+
+| | `rr` | `min_stop_pct` | `timeout` | ghi chú |
+|---|---|---|---|---|
+| Combo A | 2.53 | 0.29 | 315' | `sl_atr_mult` 0.09 (rất hẹp) |
+| Combo B | **0.97** | **0.77** | 90' | `sl_atr_mult` 2.3, `vol_mult` 1.2 |
+| Combo C | 1.89 | 0.23 | 69' | `max_stop_pct` 1.7, `price_drop_pct` 1.2 |
+
+Hai điều đáng chú ý. Thứ nhất, **hyperopt tự tìm ra đúng đòn bẩy mà §2 đã chỉ**: với
+Combo B nó đẩy sàn stop từ 0.35 lên 0.77, làm `s` nở ra 0.841% và `f` tụt từ 0.228 xuống
+**0.101**. Phần cơ học của mô hình chi phí là đúng và đo được. Thứ hai, nó **hạ** RR của
+Combo B xuống 0.97 chứ không nâng — thêm một bằng chứng nữa rằng RR không phải biến
+mang edge (xem §6.3).
+
+### 7.3. Kết quả — fit so với holdout
+
+| | n | `s` | `f` | gross | net | PF | **PnL** | Sharpe |
+|---|---|---|---|---|---|---|---|---|
+| **A — fit** | 34 | 0.343% | 0.244 | +0.254 R | +0.010 R | 1.01 | **+0.07%** | |
+| **A — holdout** | 16 | 0.351% | 0.245 | **−0.754 R** | −0.999 R | 0.06 | **−7.60%** | |
+| A — toàn kỳ | 50 | | | | | 0.63 | −7.54% | −0.22 |
+| **B — fit** | 36 | 0.841% | **0.101** | +0.204 R | +0.103 R | 1.38 | **+2.36%** | |
+| **B — holdout** | 11 | 0.770% | 0.113 | **−0.368 R** | −0.481 R | 0.31 | **−2.39%** | |
+| B — toàn kỳ | 47 | | | | | 0.99 | −0.09% | −0.00 |
+| **C — fit** | 40 | 1.166% | 0.139 | +0.679 R | +0.539 R | 3.02 | **+11.04%** | +0.62 |
+| **C — holdout** | 23 | 0.999% | 0.168 | **−0.041 R** | −0.209 R | 0.68 | **−1.88%** | −0.19 |
+| **C — toàn kỳ** | 63 | 1.129% | 0.150 | +0.416 R | +0.266 R | **1.74** | **+8.93%** | +0.30 |
+
+Winrate của Combo C trong cửa sổ fit là **72.5%**. RISK-01 của chính SRS viết: *"Nếu
+backtest cho winrate ~70%, khả năng cao là overfit hoặc lookahead bias, không phải edge."*
+Holdout trả lời: 39.1%.
+
+### 7.4. Đọc kết quả
+
+**Yêu cầu đã được đáp ứng theo đúng câu chữ.** Cả ba combo dương trong cửa sổ fit, và
+`ComboCOpt` chạy trên **toàn bộ 31 tháng cho +8.93%, PF 1.74, max drawdown 2.80%** — hai
+trong ba tiêu chí BT-06 (PF > 1.2, DD < 15%) đều đạt.
+
+**Nhưng nó không đạt BT-06 theo đúng nghĩa BT-06 muốn nói.** BT-01 quy định chỉ được đọc
+kết quả từ các đoạn out-of-sample; đoạn OOS duy nhất ở đây là holdout, và holdout của C
+là −1.88% với Sharpe −0.19. Con số +8.93% toàn kỳ là **20 tháng đã fit cộng 12 tháng
+âm**, không phải 31 tháng độc lập.
+
+Dấu hiệu quyết định nằm ở **gross expectancy** (bỏ phí ra, tức chất lượng thuần của tín
+hiệu). Nếu tối ưu tìm được edge thật, gross phải giữ dấu qua holdout. Thực tế:
+
+| | gross fit | gross holdout | đổi dấu? |
+|---|---|---|---|
+| A | +0.254 R | −0.754 R | có |
+| B | +0.204 R | −0.368 R | có |
+| C | +0.679 R | −0.041 R | có |
+
+Cả ba lật dấu. Đây là chữ ký của nhiễu đã được khớp, không phải của edge bị nhiễu che.
+
+Cần công bằng ở một điểm: holdout của C có khoảng tin cậy 95% là **[−0.65, +0.23] R**,
+tức nó *chứa 0*. Phát biểu đúng là "holdout không xác nhận được edge", không phải
+"holdout chứng minh không có edge" — 23 lệnh thì không chứng minh được gì theo cả hai
+chiều. Điều chắc chắn duy nhất là: **+0.679 R của cửa sổ fit không tái lập được.**
+
+### 7.5. Ba bẫy kỹ thuật gặp phải, ghi lại để khỏi mất thời gian lần sau
+
+1. **Hàm mục tiêu Sharpe bị hyperopt khai thác bằng mẫu 3 lệnh** (§7.1). Bất kỳ vòng
+   hyperopt nào trên chiến lược tần suất thấp đều cần sàn số lệnh trong chính hàm loss,
+   không phải lọc sau.
+2. **File tham số đặt tên theo TÊN FILE strategy, không theo tên class.** Ba lớp
+   `ComboAOpt/BOpt/COpt` để chung `ComboOpt.py` dùng chung `ComboOpt.json`, ghi đè nhau,
+   và lần chạy sau báo `Invalid parameter file provided`. Phải tách một file một lớp.
+3. **`freqtrade hyperopt` từ chối chạy song song** ("Another running instance detected").
+   Phải xếp hàng tuần tự.
+4. **Hyperopt chạy không có `--timeframe-detail` cho số lạc quan hơn thực tế**, và lệch
+   nhiều nhất đúng ở vùng stop hẹp mà nó có xu hướng đi vào: Combo B +4.99% → +2.36% khi
+   thêm detail 1m; Combo A +1.00% → +0.07%. Mọi con số ở §7.3 là bản CÓ detail.
+
+### 7.6. Kết luận vòng 3
+
+Vòng 3 không lật được kết luận của §2 và §6, nó **xác nhận** hai kết luận đó bằng một
+đường khác: tìm được cấu hình có lãi là chuyện dễ (126/271 epoch đủ mẫu của Combo B có
+lãi), giữ được lãi sang đoạn dữ liệu chưa fit là chuyện không xảy ra.
+
+RISK-03 của SRS đã nói trước chính xác điều này: *"chiến lược có lãi in-sample thường
+không giữ được hiệu quả out-of-sample, và lợi nhuận chủ yếu đến từ việc chọn tham số hơn
+là từ market inefficiency thật."* Vòng 3 là phép thử trực tiếp, và câu đó đúng.
+
+Muốn đẩy PnL toàn kỳ của cả A và B lên dương nữa thì chỉ cần fit thẳng trên toàn kỳ —
+chắc chắn được, và cũng chắc chắn vô nghĩa, vì lúc đó không còn đoạn dữ liệu nào để kiểm.
+
+### 7.7. Tái lập vòng 3
+
+```bash
+# Hyperopt — PHẢI chạy tuần tự, freqtrade không cho hai lượt song song
+freqtrade hyperopt --config config-scalp-bt.json --strategy ComboAOpt \
+  --hyperopt-loss ExpectancyTStatLoss --spaces buy sell \
+  --timerange 20240101-20250801 -e 500 -j 6 --random-state 42
+# ... rồi ComboBOpt, rồi ComboCOpt (kèm --config config-scalp-bt-C.json)
+
+# Fit / holdout / toàn kỳ — LUÔN kèm --timeframe-detail 1m
+freqtrade backtesting --config config-scalp-bt.json --strategy ComboBOpt \
+  --timerange 20240101-20250801 --timeframe-detail 1m   # fit
+freqtrade backtesting --config config-scalp-bt.json --strategy ComboBOpt \
+  --timerange 20250801-20260807 --timeframe-detail 1m   # holdout
+```
+
+File thêm: `strategies/ComboAOpt.py`, `ComboBOpt.py`, `ComboCOpt.py` (lớp con mỏng, chỉ
+mở khoá hyperopt cho `rr` / `timeout_minutes` / `min_stop_pct`) và
+`user_data/hyperopts/ExpectancyTStatLoss.py`. Tham số đã chốt nằm trong
+`user_data/strategies/Combo{A,B,C}Opt.json` — ★ thư mục `user_data/` bị gitignore, ba
+file json này chỉ có ở máy local.
