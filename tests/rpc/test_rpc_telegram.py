@@ -3638,6 +3638,106 @@ def test__next_analysis_slot():
     assert nxt3.hour == 11  # đúng 07:00 -> mốc kế tiếp, không lặp lại chính nó
 
 
+def _auto_entry_decision(**over) -> dict:
+    """Quyết định 'được phép vào lệnh' tối thiểu, ghi đè từng khoá để dựng ca lỗi."""
+    return {
+        "reject": None,
+        "direction": "long",
+        "entry_worst": 60000.0,
+        "stop": 59000.0,
+        "rr_first": 2.5,
+        "timeframe": "4h",
+        **over,
+    }
+
+
+def test__auto_entry_from_analysis_places_order(default_conf, mocker) -> None:
+    telegram, freqtradebot, _msg = get_telegram_testobject(mocker, default_conf)
+    fe = mocker.patch.object(telegram._rpc, "_rpc_force_entry", return_value=MagicMock())
+
+    line = telegram._auto_entry_from_analysis(freqtradebot, "BTC/USDT", _auto_entry_decision())
+
+    assert line is not None and line.startswith("✅")
+    # Limit tại MÉP XẤU NHẤT của vùng — cùng con số mà R:R trong báo cáo tính trên đó.
+    assert fe.call_args[0][1] == 60000.0
+    assert fe.call_args[1]["order_type"] == "limit"
+    assert fe.call_args[1]["enter_tag"] == "analysis_auto"
+
+
+def test__auto_entry_from_analysis_skips(default_conf, mocker) -> None:
+    """Ba trường hợp KHÔNG được vào lệnh — im lặng, không gọi tới sàn."""
+    telegram, freqtradebot, _msg = get_telegram_testobject(mocker, default_conf)
+    fe = mocker.patch.object(telegram._rpc, "_rpc_force_entry")
+
+    # Báo cáo nói BỎ LỆNH -> hành động phải khớp với tin nhắn.
+    assert (
+        telegram._auto_entry_from_analysis(
+            freqtradebot, "BTC/USDT", _auto_entry_decision(reject="R:R không đạt")
+        )
+        is None
+    )
+    # Short: strategy long-only, vào short sẽ tạo vị thế mà callback thoát lệnh không hiểu.
+    assert (
+        telegram._auto_entry_from_analysis(
+            freqtradebot, "BTC/USDT", _auto_entry_decision(direction="short")
+        )
+        is None
+    )
+    assert fe.call_count == 0
+
+    # Thiếu SL -> KHÔNG rơi về giá thị trường, vì đó sẽ là một lệnh khác với lệnh đã báo.
+    line = telegram._auto_entry_from_analysis(
+        freqtradebot, "BTC/USDT", _auto_entry_decision(stop=None)
+    )
+    assert line is not None and "thiếu giá entry hoặc SL" in line
+    assert fe.call_count == 0
+
+
+def test__auto_entry_from_analysis_reports_limit_reached(default_conf, mocker) -> None:
+    """Hết slot là hoạt động bình thường của hạn mức — nhưng phải NÓI RA, không im lặng."""
+    from freqtrade.rpc import RPCException
+
+    telegram, freqtradebot, _msg = get_telegram_testobject(mocker, default_conf)
+    mocker.patch.object(
+        telegram._rpc,
+        "_rpc_force_entry",
+        side_effect=RPCException("Maximum number of trades is reached."),
+    )
+
+    line = telegram._auto_entry_from_analysis(freqtradebot, "BTC/USDT", _auto_entry_decision())
+    assert line is not None and line.startswith("⛔")
+    assert "Maximum number of trades" in line
+
+
+async def test_run_scheduled_analysis_auto_entry(default_conf, mocker) -> None:
+    telegram, freqtradebot, msg_mock = get_telegram_testobject(mocker, default_conf)
+    freqtradebot.active_pair_whitelist = ["BTC/USDT", "ETH/USDT"]
+    mocker.patch.object(
+        telegram, "_build_analysis", AsyncMock(return_value=("report", _auto_entry_decision()))
+    )
+    auto = mocker.patch.object(telegram, "_auto_entry_from_analysis", return_value="✅ ok")
+
+    # auto_entry TẮT -> chỉ gửi báo cáo, không đụng tới lệnh.
+    await telegram._run_scheduled_analysis({"max_pairs": 2})
+    assert auto.call_count == 0
+
+    # Bật nhưng force_entry_enable=false -> cảnh báo, vẫn không vào lệnh nào.
+    msg_mock.reset_mock()
+    freqtradebot.config["force_entry_enable"] = False
+    await telegram._run_scheduled_analysis({"max_pairs": 2, "auto_entry": {"enabled": True}})
+    assert auto.call_count == 0
+    assert "force_entry_enable" in msg_mock.call_args_list[0][0][0]
+
+    # Bật đủ -> vào lệnh, nhưng max_per_run chặn ở 1 dù có 2 cặp.
+    msg_mock.reset_mock()
+    freqtradebot.config["force_entry_enable"] = True
+    await telegram._run_scheduled_analysis(
+        {"max_pairs": 2, "auto_entry": {"enabled": True, "max_per_run": 1}}
+    )
+    assert auto.call_count == 1
+    assert "Vào lệnh tự động" in msg_mock.call_args_list[-1][0][0]
+
+
 def test__smc_wave_estimate():
     def piv(*seq):
         return [{"type": "H" if p[0] == "H" else "L", "price": p[1]} for p in seq]
