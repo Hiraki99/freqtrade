@@ -1504,7 +1504,21 @@ class Telegram(RPCHandler):
         :param direction: "long" | "short" | None (các khung xung đột)
         :return: dict quyết định; `reject=None` là được phép vào lệnh
         """
+        # Ngưỡng R:R để một setup được coi là đáng vào. Lấy theo TỪNG BOT qua
+        # `telegram.min_rr`, mặc định 2.0 như trước. Bot scalping cần ngưỡng thấp hơn: mốc
+        # thanh khoản trên khung 5m nằm gần nhau, đòi 1:2 thì gần như mọi setup đều bị BỎ LỆNH.
+        # Cái giá của ngưỡng thấp là tỉ lệ thắng phải cao hơn tương ứng mới hòa vốn.
+        #
+        # Kiểm KIỂU chứ không bọc try/except: `float()` nuốt gọn mọi thứ có `__float__`, và
+        # MagicMock có sẵn `__float__` trả về 1.0 — một strategy giả sẽ âm thầm hạ ngưỡng
+        # xuống 1:1 mà không hàm nào ném lỗi để lộ ra. Chuỗi "1.5" cũng bị từ chối: ngưỡng
+        # rủi ro sai kiểu phải rơi về mặc định an toàn, không phải được đoán ý.
         min_rr = 2.0
+        cfg = getattr(strategy, "config", None)
+        tg = cfg.get("telegram") if isinstance(cfg, dict) else None
+        cfg_rr = tg.get("min_rr") if isinstance(tg, dict) else None
+        if isinstance(cfg_rr, (int, float)) and not isinstance(cfg_rr, bool) and cfg_rr > 0:
+            min_rr = float(cfg_rr)
         base_out: dict = {
             "min_rr": min_rr,
             "direction": direction,
@@ -1576,7 +1590,7 @@ class Telegram(RPCHandler):
         elif hit is None:
             reject = (
                 f"mốc xa nhất chỉ đạt 1:{abs(merged[-1][0] - entry_worst) / rr_risk:.1f}, "
-                f"dưới ngưỡng 1:{min_rr:.0f}"
+                f"dưới ngưỡng 1:{min_rr:g}"
             )
 
         return {
@@ -1703,7 +1717,7 @@ class Telegram(RPCHandler):
             )
         if hit:
             out.append(
-                f"• Chốt lời: TP{hit} là mốc thật đầu tiên đạt 1:{min_rr:.0f} — giữ tối thiểu tới "
+                f"• Chốt lời: TP{hit} là mốc thật đầu tiên đạt 1:{min_rr:g} — giữ tối thiểu tới "
                 f"đó; các mốc trước nó chỉ chốt MỘT PHẦN."
             )
         # Cắt bớt phải NÓI RA: mốc bị bỏ vẫn là mốc thật, chỉ là quá xa để dùng.
@@ -1741,7 +1755,7 @@ class Telegram(RPCHandler):
             far_r = abs(merged[-1][0] - entry_worst) / rr_risk
             out.append(
                 f"❌ *BỎ LỆNH:* mốc cấu trúc xa nhất chỉ đạt `1 : {far_r:.1f}`, dưới ngưỡng "
-                f"1:{min_rr:.0f} — rủi ro lớn mà lợi nhuận nhỏ. Chỉ vào lệnh nếu siết được SL "
+                f"1:{min_rr:g} — rủi ro lớn mà lợi nhuận nhỏ. Chỉ vào lệnh nếu siết được SL "
                 "sát biên OB hơn để tỉ lệ đạt chuẩn."
             )
         if stop:

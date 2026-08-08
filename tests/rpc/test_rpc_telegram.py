@@ -3638,6 +3638,39 @@ def test__next_analysis_slot():
     assert nxt3.hour == 11  # đúng 07:00 -> mốc kế tiếp, không lặp lại chính nó
 
 
+def test__smc_trade_decision_min_rr_per_bot(default_conf, mocker) -> None:
+    """Ngưỡng R:R lấy theo từng bot: bot scalping hạ 1:1 vẫn vào, bot mặc định 1:2 thì BỎ LỆNH."""
+    _telegram, freqtradebot, _msg = get_telegram_testobject(mocker, default_conf)
+    strategy = freqtradebot.strategy
+    # Entry 100-102 (mép xấu nhất 102), đáy OB 98 -> SL ~97.5, risk ~4.5.
+    # Mốc TP thật ở 108 -> ~1.3R: qua được 1:1, trượt 1:2.
+    lv = {
+        "poi_top": 102.0,
+        "poi_bot": 100.0,
+        "swing_low": 98.0,
+        "swing_high": 108.0,
+        "equilibrium": 103.0,
+    }
+
+    strategy.config["telegram"] = {}
+    d2 = Telegram._smc_trade_decision(strategy, lv, 104.0, "long")
+    assert d2["min_rr"] == 2.0
+
+    strategy.config["telegram"] = {"min_rr": 1.0}
+    d1 = Telegram._smc_trade_decision(strategy, lv, 104.0, "long")
+    assert d1["min_rr"] == 1.0
+
+    # Cùng một setup, chỉ khác ngưỡng -> phán quyết phải khác nhau đúng theo ngưỡng.
+    if d1["rr_first"]:
+        assert (d1["reject"] is None) == (d1["rr_first"] >= 1.0)
+        assert (d2["reject"] is None) == (d1["rr_first"] >= 2.0)
+
+    # Config hỏng / strategy giả không được làm gãy đường dựng báo cáo.
+    strategy.config["telegram"] = {"min_rr": "xxx"}
+    assert Telegram._smc_trade_decision(strategy, lv, 104.0, "long")["min_rr"] == 2.0
+    assert Telegram._smc_trade_decision(MagicMock(), lv, 104.0, "long")["min_rr"] == 2.0
+
+
 def _auto_entry_decision(**over) -> dict:
     """Quyết định 'được phép vào lệnh' tối thiểu, ghi đè từng khoá để dựng ca lỗi."""
     return {
