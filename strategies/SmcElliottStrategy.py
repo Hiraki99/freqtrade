@@ -168,8 +168,12 @@ class SmcElliottStrategy(IStrategy):
     #   Edge nằm ở luật nền (POI + G1/G2 + lệnh chờ), KHÔNG nằm ở hệ chấm điểm.
     #   Cột `score` vẫn được tính để làm telemetry / factor analysis vòng sau.
     min_score = IntParameter(-100, 100, default=-100, space="buy", optimize=True)
-    require_htf = BooleanParameter(default=True, space="buy", optimize=False)  # G1
-    require_discount = BooleanParameter(default=True, space="buy", optimize=False)  # G2
+    # optimize=True từ 2026-08-08: khoá cứng hai cổng này làm hyperopt không thể thử tắt chúng,
+    # và trên khung 5m chúng gần như chặn hết — vòng hyperopt đầu (200 epoch, G1/G2 khoá) ra
+    # trung vị 6 lệnh / 20 tháng và 0 epoch có lãi. Mặc định vẫn True nên hành vi chạy thật
+    # KHÔNG đổi; chỉ mở rộng không gian tìm kiếm.
+    require_htf = BooleanParameter(default=True, space="buy", optimize=True)  # G1
+    require_discount = BooleanParameter(default=True, space="buy", optimize=True)  # G2
     adx_min = IntParameter(15, 30, default=20, space="buy", optimize=True)
     # Mặc định TẮT: với lệnh chờ tại POI, nến signal thường CHƯA chạm vùng nên
     # "nến tăng tại nến signal" không còn là xác nhận có nghĩa.
