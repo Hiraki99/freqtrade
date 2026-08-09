@@ -25,8 +25,25 @@ vào phi-SMC thật sự cần thay:
 Cổng điểm `min_score` giữ ở -100 (tắt) và KHÔNG tối ưu: hệ chấm điểm đã bị đo là vô dụng, và
 ở đây nó cũng không còn dữ liệu để chấm.
 
-Đối chứng: SmcElliottStrategy trên 197 cặp / 4h / 2023-03-08..2026-07-02 = +23.44%, PF 3.83,
-137 lệnh, DD 1.02%. Cùng khung đo đó là phép thử của bản này.
+Đối chứng: SmcElliottStrategy trên 197 cặp / 4h / 2023-03-08..2026-07-02.
+
+★ KẾT QUẢ (2026-08-09) — BẢN NÀY THUA, GIỮ LẠI LÀM KẾT QUẢ ÂM:
+  Đo với --timeframe-detail 1h (mô hình khớp lệnh thực tế; xem _warning_fill_model trong
+  smc-universe.json). Không có nó, mọi con số dưới đây cao hơn 2-4 lần và kết luận NGƯỢC LẠI.
+
+                      SmcElliott          SmcPure
+    FULL     +14.46% PF 2.25 DD 1.09%   +11.78% PF 1.20 DD 7.88%
+    FIT      +12.03% PF 2.43            +17.20% PF 1.63
+    HOLDOUT   +2.43% PF 1.78 DD 1.22%    -5.30% PF 0.84 DD 9.03%   <- LỖ
+
+  Bỏ chỉ báo cổ điển làm số lệnh tăng 4 lần (137 -> 537) và trên nến 4h trông như lãi gấp đôi
+  (+44.52% vs +23.44%). Nhưng 4 lần số lệnh cũng là 4 lần phơi nhiễm với giả định khớp lệnh:
+  khi tăng phân giải, lợi nhuận SmcPure bốc hơi 74% và drawdown nở gấp 3, còn SmcElliott chỉ
+  giảm đều và drawdown gần như không đổi (1.02% -> 1.09%).
+
+  => Bias HTF theo EMA50/200 (bản gốc) LỌC TỐT HƠN bias theo cấu trúc ngày (bản này). EMA chậm
+     hơn nhiều tháng, và chính độ chậm đó loại được đám setup biên mà bản này nhận vào.
+  => KHÔNG dùng chạy thật. Giữ file để lần sau không ai đi lại đúng con đường này.
 """
 
 from __future__ import annotations
