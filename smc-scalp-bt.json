@@ -1,0 +1,59 @@
+{
+    "$schema": "https://schema.freqtrade.io/schema.json",
+    "bot_name": "smc-scalp-rr-bt",
+    "_comment": "Config CHỈ để backtest quét R:R của SmcScalpRR.py trên BTC perp 5m. ĐỨNG ĐỘC LẬP — không merge config.json / config-5m.json. Tên file né .gitignore:2 (config*.json) để vẫn được git track, theo tiền lệ smc-universe.json.",
+    "_comment_no_roi_no_sl": "★ TUYỆT ĐỐI KHÔNG đặt minimal_roi / stoploss ở đây. Hai khoá đó trong config THẮNG thuộc tính strategy, và chúng chính là lý do lần đo 5m trước (2026-08-09) vô giá trị: config-5m.json áp ROI 2% + stop -2%, kết quả 320/600 lệnh thoát bằng `roi` và KHÔNG MỘT LỆNH NÀO thoát bằng tp2 — tức phép đo đó không hề đo R:R của SMC mà đo cái ROI ladder. Strategy tự đặt minimal_roi {0:10} (vô hiệu) và stoploss -0.10 (đệm rộng hơn max_risk_pct 3%), để SL cấu trúc và TP theo R được quyết định trong custom_stoploss/custom_exit.",
+    "timeframe": "5m",
+    "max_open_trades": 1,
+    "_comment_g01": "Một vị thế mở tại một thời điểm — cùng ràng buộc như bot 5m live, và freqtrade vốn không cho hai lệnh mở trên cùng một cặp.",
+    "stake_currency": "USDT",
+    "stake_amount": 1000,
+    "dry_run_wallet": 10000,
+    "_comment_stake": "Stake CỐ ĐỊNH 1000/10000 chứ không 'unlimited'. Lý do: 'unlimited' + 1 slot = trọn ví mỗi lệnh, lợi nhuận cộng dồn theo thứ tự lệnh, nên biến thể nào tình cờ thắng sớm sẽ được khuếch đại — đúng thứ làm nhiễu phép so sánh 4 biến thể. Stake cố định cho tổng lợi nhuận % tuyến tính theo số lệnh, còn PF và expectancy thì vốn không phụ thuộc stake. Strategy không có callback leverage() nên đòn bẩy = 1.0, stake 1000 = notional 1000.",
+    "dry_run": true,
+    "tradable_balance_ratio": 0.99,
+    "fiat_display_currency": "USD",
+    "trading_mode": "futures",
+    "margin_mode": "isolated",
+    "fee": 0.00045,
+    "_comment_fee": "Dùng lại đúng con số của bộ scalping combo (docs/BT-BTC-Scalping-Combos.md) để hai nhánh việc so được với nhau: freqtrade áp MỘT mức phí cho cả hai chiều, nên 0.045%/chiều = 0.09% khứ hồi = maker entry 0.02% + taker exit 0.05% + slippage 0.02%. Entry của SmcElliott là buy-limit chờ tại POI nên maker là đúng; TP thoát bằng custom_exit nên taker là đúng. VỚI R:R THẤP ĐÂY LÀ KHOÁ NHẠY NHẤT: R thật chỉ 1.5-3.0% nên 0.09% = 0.03-0.06 R, và ở R:R 1:0.3 mỗi 0.01 R phí đẩy ngưỡng hoà vốn lên ~0.8 điểm phần trăm win rate.",
+    "unfilledtimeout": {
+        "entry": 120,
+        "exit": 10,
+        "exit_timeout_count": 0,
+        "unit": "minutes"
+    },
+    "_comment_unfilledtimeout": "120 phút = 24 nến 5m. Chọn theo SỐ NẾN của bot 4h (5760 phút = 24 nến 4h, mức đo được ~49% lệnh chờ khớp) chứ không theo số phút. KHÔNG dùng 10 phút của config.json: 2 nến thì luật 'đặt limit tại POI rồi chờ giá hồi về' không có cơ hội chạy. Khoá này trong config LUÔN thắng thuộc tính strategy (strategy_resolver.py:73), nên phải đặt ở đây. Nó tác động ĐỒNG ĐỀU lên cả 4 biến thể (chỉ ảnh hưởng lệnh VÀO, không dính tới TP), nên không làm lệch phép so sánh R:R — nhưng nó đặt mức số lệnh chung của cả bảng.",
+    "_comment_pricing": "use_order_book PHẢI là true: với binance futures, đặt false làm config_validation từ chối chạy (\"Ticker pricing not available for Binance\") vì lớp Binance không cung cấp ticker cho chế độ swap. Backtest không đọc sổ lệnh nên hai khối này chỉ để qua vòng kiểm tra cấu hình.",
+    "entry_pricing": {
+        "price_side": "same",
+        "use_order_book": true,
+        "order_book_top": 1,
+        "price_last_balance": 0.0
+    },
+    "exit_pricing": {
+        "price_side": "same",
+        "use_order_book": true,
+        "order_book_top": 1
+    },
+    "exchange": {
+        "name": "binance",
+        "key": "",
+        "secret": "",
+        "ccxt_config": {},
+        "ccxt_async_config": {},
+        "pair_whitelist": [
+            "BTC/USDT:USDT"
+        ],
+        "pair_blacklist": []
+    },
+    "pairlists": [
+        {
+            "method": "StaticPairList"
+        }
+    ],
+    "dataformat_ohlcv": "feather",
+    "internals": {
+        "process_throttle_secs": 5
+    }
+}
