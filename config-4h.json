@@ -24,7 +24,8 @@
     "telegram": {
         "analysis_schedule": {
             "enabled": true,
-            "interval_hours": 4,
+            "_comment_interval": "2026-08-11: 4h -> 1h theo yêu cầu. Mốc chạy = neo day_start_hour + bội số chu kỳ (telegram.py:_next_analysis_slot), nên lịch mới là HH:01:00 UTC mỗi giờ (offset_seconds=60). Đây là chu kỳ BÁO CÁO, không phải khung phân tích: kế hoạch vẫn dựng trên nến 4h đã đóng, nên 3 trong 4 lượt sẽ đọc ĐÚNG cây nến 4h của lượt trước — chỉ phiếu 15m/1h và giá live là mới. Đó chính là mục đích: hướng có thể đổi giữa nến 4h thay vì phải chờ nó đóng. Ba hệ quả: (1) auto_entry được xét mỗi giờ thay vì mỗi 4 giờ, max_per_run=2 vẫn giữ nhưng trần thật là max_open_trades=2 và cặp đang có lệnh sẽ bị _rpc_force_entry từ chối, nên không có chuyện vào chồng; (2) Telegram: 1 tiêu đề + 6 cặp = 7 tin/lượt x 24 lượt = ~168 tin/ngày, gấp 4 lần trước; (3) 4 khung x 6 cặp = 24 lần get_historic_ohlcv mỗi lượt -> ~576 lần/ngày. Muốn thưa lại thì đổi số này về 4, KHÔNG dùng interval_minutes (khoá đó thắng interval_hours và dành cho bot 5m).",
+            "interval_hours": 1,
             "day_start_hour": 0,
             "timezone": "UTC",
             "offset_seconds": 60,
