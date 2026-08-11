@@ -1,0 +1,62 @@
+{
+    "$schema": "https://schema.freqtrade.io/schema.json",
+    "bot_name": "smc-5m-scalp",
+    "timeframe": "5m",
+    "_comment_futures": "KHÔNG đặt trading_mode ở đây — kế thừa futures/isolated từ config.json (đổi 2026-08-07), kèm whitelist futures có cả XAU. Trước đó config.json là spot nên bot này chạy spot và /scalp luôn lỗi ở XAU/USDT (Binance spot không niêm yết XAU).",
+    "_comment_db": "DB RIÊNG cho futures, theo tiền lệ config-4h.json. tradesv3.5m.sqlite (15 trade spot) giữ nguyên để tra cứu, không migrate — lúc chuyển có 0 lệnh đang mở.",
+    "db_url": "sqlite:///tradesv3.5m-futures.sqlite",
+    "_comment_sizing": "Phân bổ riêng cho bot 5m. Sửa 2026-08-08 sau khi rút whitelist về một mình BTC: freqtrade KHÔNG cho hai lệnh mở trên cùng một cặp, nên 4 slot x 50 USDT trở thành 1 lệnh x 50 = chỉ 5% ví được dùng, không phải 20% như đã phân bổ (backtest tự hạ xuống 'Max open trades: 1'). Gộp lại thành 1 lệnh x 200 USDT để giữ đúng 20%. HỆ QUẢ: mỗi lệnh giờ là 20% ví thay vì 5% — cùng tổng phơi nhiễm nhưng dồn vào một vị thế, nên một lệnh dính SL -2% mất 4 USDT chứ không phải 1. Thêm cặp thứ hai vào whitelist thì phải chia lại hai con số này.",
+    "max_open_trades": 1,
+    "_comment_stake_unlimited": "\"unlimited\" chứ KHÔNG phải số 200. Đặt stake_amount=200 bằng đúng available_capital=200 làm bot chết cứng sau lệnh thua đầu tiên: get_total_stake_amount() trả available_capital + tot_profit, lỗ một chút là tụt dưới 200, rồi _check_available_stake_amount() từ chối MỌI lệnh sau đó — đo được trên backtest, 81 lệnh rơi xuống còn 6. Với \"unlimited\" và 1 slot, stake = trọn phần vốn được cấp và tự co giãn theo lãi/lỗ, không bao giờ kẹt.",
+    "stake_amount": "unlimited",
+    "_comment_available_capital": "Phần vốn dành riêng cho bot này — xem giải thích trong config-4h.json. Hai bot cộng lại 400/1000, phần còn lại cố ý để trống.",
+    "available_capital": 200,
+    "minimal_roi": {
+        "0": 0.02,
+        "20": 0.01,
+        "40": 0.005,
+        "60": 0
+    },
+    "stoploss": -0.02,
+    "_comment_whitelist": "CHỈ BTC (2026-08-08, theo yêu cầu). Deep-merge chỉ đè pair_whitelist, các khoá khác trong exchange (name, key, ccxt_config) vẫn kế thừa config.json. Bot 4h không bị ảnh hưởng — nó có whitelist riêng 6 cặp. Hệ quả cần nhớ: freqtrade chỉ cho MỘT lệnh mở trên mỗi cặp, nên một cặp = tối đa 1 lệnh mở cùng lúc, bất kể max_open_trades=4 (xem _comment_sizing).",
+    "exchange": {
+        "pair_whitelist": [
+            "BTC/USDT:USDT"
+        ]
+    },
+    "_comment_analysis_schedule": "Thêm 2026-08-08. Trước đó bot 5m KHÔNG có lịch nào — đó là lý do bật auto_entry ở đây trước đây sẽ không làm gì cả. Khác lịch bot 4h ở hai chỗ, đều theo nhịp scalping: chạy mỗi 1h thay vì 4h, và bộ timeframes bắt đầu từ 5m.",
+    "telegram": {
+        "_comment_min_rr": "Ngưỡng R:R tối thiểu để một setup được coi là đáng vào; dưới ngưỡng thì báo cáo ghi BỎ LỆNH và auto_entry không vào. Mặc định toàn hệ là 2.0 (bot 4h giữ nguyên); hạ xuống 1.15 cho riêng bot 5m (2026-08-08, theo yêu cầu — đặt 1.0 lúc đầu rồi user chỉnh lên 1.15) vì mốc thanh khoản trên khung 5m nằm sát nhau, đòi 1:2 thì gần như mọi setup đều bị loại. ĐÁNH ĐỔI: ở 1:1.15 cần tỉ lệ thắng > ~46.5% CỘNG phí và slippage mới hòa vốn, so với > ~33% ở 1:2. Phần 0.15 chính là biên bù phí — 1:1 chẵn thì mọi khoản phí đều ăn thẳng vào kỳ vọng. Ngưỡng này không đổi cách đặt SL/TP, chỉ đổi mức chấp nhận.",
+        "min_rr": 1.15,
+        "analysis_schedule": {
+            "enabled": true,
+            "_comment_interval": "15 phút/lượt (2026-08-08, theo yêu cầu) — interval_minutes THẮNG interval_hours, khoá kia giữ lại chỉ để làm mốc so sánh. Bot scalping đợi 60 phút thì kèo đã đi mất trước lượt phân tích kế tiếp. GIÁ PHẢI TRẢ: 4 lượt/giờ x (1 header + 5 báo cáo) = 24 tin Telegram mỗi giờ, ~576 tin/ngày; và 4 x 5 cặp x 4 khung = 80 lượt fetch nến mỗi giờ. Thấy ồn hoặc bị rate-limit thì giảm max_pairs trước, rồi mới nới interval.",
+            "interval_minutes": 15,
+            "interval_hours": 1,
+            "day_start_hour": 0,
+            "timezone": "UTC",
+            "offset_seconds": 60,
+            "_comment_timeframes": "PHẢI có '5m' trong danh sách: _smc_report_context() chọn khung dựng kế hoạch = strategy.timeframe nếu nó có mặt, không thì rơi về '4h'. Thiếu 5m ở đây thì bot scalping sẽ vào lệnh theo kế hoạch khung 4h. KHÔNG thêm '1d': hướng vào lệnh là bỏ phiếu đa số trên các khung này, thêm daily vào một bot giữ lệnh vài chục phút là để khung dài quyết hộ.",
+            "timeframes": [
+                "5m",
+                "15m",
+                "1h",
+                "4h"
+            ],
+            "max_pairs": 1,
+            "_comment_auto_entry": "Cùng cơ chế bot 4h — xem giải thích đầy đủ trong config-4h.json. Nhắc lại điểm quan trọng: đường này bỏ qua G1/G2/score và CHƯA từng được backtest. max_open_trades (4), stake_amount (50) và available_capital (200) vẫn được tôn trọng.",
+            "auto_entry": {
+                "enabled": true,
+                "_comment_max_per_run": "2 chứ không phải 4 (= max_open_trades): lịch chạy MỖI GIỜ, nên một giờ xấu chỉ lấp được nửa số slot, giờ sau còn chỗ cho setup tốt hơn.",
+                "max_per_run": 2
+            }
+        }
+    },
+    "_comment_force_entry": "Bắt buộc cho auto_entry — _rpc_force_entry() từ chối ngay nếu false. Cũng mở /forcebuy trên Telegram cho bất kỳ ai vào được chat.",
+    "force_entry_enable": true,
+    "api_server": {
+        "enabled": true,
+        "listen_ip_address": "127.0.0.1",
+        "listen_port": 8082
+    }
+}

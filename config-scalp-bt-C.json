@@ -1,0 +1,18 @@
+{
+    "$schema": "https://schema.freqtrade.io/schema.json",
+    "_comment": "Overlay CHỈ dành cho ComboCCascade. Dùng kèm: --config config-scalp-bt.json --config config-scalp-bt-C.json",
+    "_comment_price_side": "C-L6 vào bằng MARKET. freqtrade từ chối chạy nếu order_types.entry='market' mà entry_pricing.price_side='same' (\"Market entry orders require entry_pricing.price_side = 'other'\") — lệnh market luôn ăn vào phía đối diện của sổ lệnh.",
+    "entry_pricing": {
+        "price_side": "other",
+        "use_order_book": true,
+        "order_book_top": 1,
+        "price_last_balance": 0.0
+    },
+    "exit_pricing": {
+        "price_side": "other",
+        "use_order_book": true,
+        "order_book_top": 1
+    },
+    "fee": 0.0007,
+    "_comment_fee": "BT-03 cho đường taker hai chiều: (taker 0.05% + slippage 0.02%) mỗi chiều = 0.07%/chiều = 0.14% khứ hồi. Cao hơn Combo A/B (0.09%) vì C không có lệnh chờ maker — đây là chi phí của việc C-L6 chấp nhận taker để đổi lấy tính thời điểm."
+}

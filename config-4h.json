@@ -1,0 +1,73 @@
+{
+    "$schema": "https://schema.freqtrade.io/schema.json",
+    "bot_name": "smc-4h-swing",
+    "timeframe": "4h",
+    "db_url": "sqlite:///tradesv3.4h-futures.sqlite",
+    "_comment_sizing": "Phân bổ riêng cho bot 4h (2026-08-08). max_open_trades trong config.json là 4 và ĐẾM ĐỘC LẬP theo từng bot — chạy song song với bot 5m thành 8 lệnh, gấp đôi ý đồ. Ở đây: 2 lệnh x 100 USDT = 10% ví mỗi lệnh, 20% tổng. freqtrade KHÔNG hỗ trợ stake_amount dạng phần trăm (config_schema: number hoặc 'unlimited'), nên 10% phải viết thành số tuyệt đối theo dry_run_wallet=1000 — đổi vốn thì phải sửa tay cả hai con số.",
+    "max_open_trades": 2,
+    "stake_amount": 100,
+    "_comment_available_capital": "Phần vốn dành riêng cho bot này. Bắt buộc khi hai bot dùng CHUNG một tài khoản sàn (live): không có nó, mỗi bot nhìn thấy toàn bộ số dư và tưởng mình được tiêu hết. Đây cũng là trần cứng — wallets.get_available_stake_amount() chặn ở đây, nên bot không vượt 200 kể cả khi có callback tăng size.",
+    "available_capital": 200,
+    "_comment_unfilledtimeout": "SmcElliottStrategy đặt buy-limit tại vùng POI và CHỜ giá hồi về. entry 5760 phút = 96h = 24 nến 4h (đo trên 25 cặp 2023-2026: ~49% lệnh chờ khớp trong 24 nến). config.json mặc định 10 phút sẽ huỷ lệnh ngay nến sau, và config LUÔN thắng thuộc tính unfilledtimeout của strategy (strategy_resolver.py:73). Đơn vị chỉ nhận minutes/seconds — 'candles' KHÔNG được hỗ trợ (interface.py:1737 dùng timedelta(**{unit: -timeout})). Exit giữ 10 phút để lệnh thoát được đặt lại giá nhanh.",
+    "unfilledtimeout": {
+        "entry": 5760,
+        "exit": 10,
+        "exit_timeout_count": 0,
+        "unit": "minutes"
+    },
+    "_comment_api_port": "8081 -> 8091 (2026-08-05). 8081 là PORT MẶC ĐỊNH CỦA METRO BUNDLER (React Native/Expo). Bot này giữ 8081 nên iPad dev-client không kết nối được Metro: uvicorn của freqtrade nhận WebSocket /message?role=ios và /inspector/device rồi từ chối 403 — đã ghi 8209 dòng vào user_data/logs/smc-4h.log. HTTP thường vẫn trả 200 (SPA fallback) nên rất dễ chẩn đoán nhầm. ĐỪNG đẩy về 8081. Bot 5m ở 8082 (config-5m.json); 8080 là mặc định config.json, không bot nào dùng.",
+    "api_server": {
+        "enabled": true,
+        "listen_ip_address": "127.0.0.1",
+        "listen_port": 8091
+    },
+    "telegram": {
+        "analysis_schedule": {
+            "enabled": true,
+            "interval_hours": 4,
+            "day_start_hour": 0,
+            "timezone": "UTC",
+            "offset_seconds": 60,
+            "_comment_timeframes": "2026-08-11: ĐƯA 15m VÀ 1h TRỞ LẠI theo yêu cầu, quay về danh sách [15m,1h,4h,1d] như trước 2026-08-08. Kế hoạch vẫn dựng trên 4h (telegram.py:_smc_report_context, stf = strategy.timeframe khi nó có mặt) và bias vẫn lấy 1d (htf), nên hai khung mới CHỈ đổi một thứ: `direction` là bỏ phiếu đa số swing_trend trên TẤT CẢ khung, mỗi khung một phiếu ngang nhau. Hệ quả phải biết trước: (a) 15m+1h cùng ngược 4h+1d -> 2-2 -> hòa -> direction=None -> ĐỨNG NGOÀI (auto_entry bỏ qua), số lần đứng ngoài sẽ tăng; (b) 15m+1h+4h cùng chiều thắng 1d 3-1, tức có thể vào LONG ngược bias daily — đúng điều lần cắt 2026-08-08 muốn chặn, vì auto_entry vốn đã bỏ qua G1 (bull_1d). Mỗi khung là một lần get_historic_ohlcv riêng (telegram.py:1123), 4 khung x 6 cặp = 24 fetch mỗi lượt chạy lịch. Khung THẤP NHẤT vẫn phải >= khung bot? KHÔNG — nhưng khung của bot (4h) BẮT BUỘC có mặt, thiếu nó thì stf rơi về avail[0] = 15m và kế hoạch swing sẽ dựng trên nến 15m.",
+            "timeframes": [
+                "15m",
+                "1h",
+                "4h",
+                "1d"
+            ],
+            "max_pairs": 6,
+            "_comment_pairs": "KHÔNG đặt 'pairs' — telegram.py:1921 sẽ tự lấy active_pair_whitelist, nhờ đó format cặp luôn khớp chế độ futures (BASE/QUOTE:SETTLE). Hardcode danh sách spot ở đây sẽ sai format.",
+            "_comment_auto_entry": "Bật 2026-08-08 theo yêu cầu: kế hoạch nào KHÔNG bị 'BỎ LỆNH' thì vào lệnh thật ngay sau khi báo cáo gửi đi. ĐÂY LÀ ĐƯỜNG VÀO LỆNH THỨ HAI, song song populate_entry_trend, và nó CỐ Ý bỏ qua G1 (bull_1d) / G2 (discount) / score — chính các cổng nằm trong phần edge đã đo trên 197 cặp. Luật này CHƯA từng được backtest. max_open_trades, stake_amount và available_capital vẫn được tôn trọng (rpc.py:1189 + wallets.get_trade_stake_amount). Tắt: đặt enabled=false.",
+            "auto_entry": {
+                "enabled": true,
+                "_comment_max_per_run": "Trần cho MỖI lượt chạy lịch, khác max_open_trades: chặn một lượt phân tích xấu quét sạch mọi slot cùng lúc. Để bằng max_open_trades (2) nghĩa là một lượt có thể lấp đầy bot.",
+                "max_per_run": 2
+            }
+        }
+    },
+    "_comment_force_entry": "Bắt buộc cho auto_entry — _rpc_force_entry() từ chối ngay nếu cờ này false. Lưu ý phụ: nó cũng mở lệnh /forcebuy trên Telegram cho bất kỳ ai vào được chat, nên không tự bật ngầm ở code mà phải khai ở đây.",
+    "force_entry_enable": true,
+    "exchange": {
+        "_comment_enable_ws": "Tắt WebSocket OHLCV. Khung 4h không cần dữ liệu realtime. Ghi lại để không ai bật lại: khi whitelist từng lên 196 cặp, 392 stream làm Binance đóng kết nối bằng close code 1008 (Policy Violation) -> 392 dòng ERROR mỗi vòng. Xem exchange.py:286 (mặc định True).",
+        "enable_ws": false,
+        "pair_whitelist": [
+            "BTC/USDT:USDT",
+            "ETH/USDT:USDT",
+            "SOL/USDT:USDT",
+            "BNB/USDT:USDT",
+            "HYPE/USDT:USDT",
+            "XAU/USDT:USDT"
+        ],
+        "_comment_blacklist": "GHI ĐÈ blacklist của config.json (['BNB/.*']) vì bot này CỐ Ý giao dịch BNB. Không ghi khoá này thì BNB/USDT:USDT bị lọc mất và whitelist còn 5 cặp.",
+        "pair_blacklist": []
+    },
+    "pairlists": [
+        {
+            "method": "StaticPairList"
+        }
+    ],
+    "_comment_futures": "Từ 2026-08-07 config.json cũng là futures/isolated, nên hai khoá dưới đây chỉ còn là lặp lại cho rõ ràng — KHÔNG xoá: giữ để bot 4h vẫn đúng chế độ nếu ai đó đưa config.json về spot. Lý do cả hệ chạy futures: HYPE và XAU KHÔNG tồn tại trên Binance spot (spot chỉ có XAUT/USDT của Tether và PAXG/USDT). SmcElliottStrategy vẫn LONG-ONLY (can_short=False) và leverage() mặc định = 1.0, nên rủi ro tương đương spot — futures ở đây chỉ để TIẾP CẬN CẶP, không phải để đòn bẩy.",
+    "trading_mode": "futures",
+    "margin_mode": "isolated",
+    "_comment_db": "DB RIÊNG cho futures. tradesv3.4h.sqlite (spot) giữ nguyên, không migrate — lúc chuyển nó đang có 0 trade nên không mất gì."
+}
