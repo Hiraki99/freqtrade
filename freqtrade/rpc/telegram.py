@@ -12,7 +12,7 @@ import re
 from collections.abc import Callable, Coroutine, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from functools import partial, wraps
 from html import escape
 from itertools import chain
@@ -52,6 +52,7 @@ from freqtrade.util import (
     format_pct,
     round_value,
 )
+from freqtrade.util.datetime_helpers import dt_now
 
 
 MAX_MESSAGE_LENGTH = MessageLimit.MAX_TEXT_LENGTH
@@ -925,7 +926,7 @@ class Telegram(RPCHandler):
         As an example with 50 trades, there will be int(50/50 + 0.99) = 1 message
         """
         messages_count = max(int(len(statlist) / max_trades_per_msg + 0.99), 1)
-        for i in range(0, messages_count):
+        for i in range(messages_count):
             trades = statlist[i * max_trades_per_msg : (i + 1) * max_trades_per_msg]
             if show_total and i == messages_count - 1:
                 # append total line
@@ -2521,7 +2522,7 @@ class Telegram(RPCHandler):
         stake_cur = self._config["stake_currency"]
         fiat_disp_cur = self._config.get("fiat_display_currency", "")
 
-        start_date = datetime.fromtimestamp(0)
+        start_date = dt_from_ts(0)
         timescale = None
         try:
             if context.args:
@@ -2531,7 +2532,7 @@ class Telegram(RPCHandler):
                         direction = arg
                         context.args.pop(0)  # Remove direction from args
                 timescale = int(context.args[0]) - 1
-                today_start = datetime.combine(date.today(), datetime.min.time())
+                today_start = datetime.combine(dt_now().date(), datetime.min.time())
                 start_date = today_start - timedelta(days=timescale)
         except (TypeError, ValueError, IndexError):
             pass
@@ -2947,8 +2948,10 @@ class Telegram(RPCHandler):
             [
                 [
                     dt_humanize_delta(dt_from_ts(trade["close_timestamp"])),
-                    f"{trade['pair']} (#{trade['trade_id']}"
-                    f"{(' ' + ('S' if trade['is_short'] else 'L')) if nonspot else ''})",
+                    (
+                        f"{trade['pair']} (#{trade['trade_id']}"
+                        f"{(' ' + ('S' if trade['is_short'] else 'L')) if nonspot else ''})"
+                    ),
                     f"{format_pct(trade['close_profit'])} ({trade['close_profit_abs']})",
                 ]
                 for trade in trades["trades"]
@@ -3180,7 +3183,7 @@ class Telegram(RPCHandler):
 
     async def send_blacklist_msg(self, blacklist: dict):
         errmsgs = []
-        for _, error in blacklist["errors"].items():
+        for error in blacklist["errors"].values():
             errmsgs.append(f"Error: {error['error_msg']}")
         if errmsgs:
             await self._send_msg("\n".join(errmsgs))
@@ -3279,7 +3282,7 @@ class Telegram(RPCHandler):
             "*/show_config:* `Show running configuration` \n"
             "*/locks:* `Show currently locked pairs`\n"
             "*/balance:* `Show bot managed balance per currency`\n"
-            "*/balance total:* `Show account balance per currency`\n"
+            "*/balance full:* `Show account balance per currency`\n"
             "*/logs [limit]:* `Show latest logs - defaults to 10` \n"
             "*/health* `Show latest process timestamp - defaults to 1970-01-01 00:00:00` \n"
             "*/marketdir [long | short | even | none]:* `Updates the user managed variable "
@@ -3463,7 +3466,7 @@ class Telegram(RPCHandler):
             )
         else:
             reply_markup = InlineKeyboardMarkup([[]])
-        msg += f"\nUpdated: {datetime.now().ctime()}"
+        msg += f"\nUpdated: {dt_now().ctime()}"
         if not query.message:
             return
 

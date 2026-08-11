@@ -275,6 +275,9 @@ Kucoin accounts may use `KCS` for fees, and if a trade happens to be on `KCS`, f
 
 ## OKX
 
+!!! Tip "Stoploss on Exchange"
+    OKX supports `stoploss_on_exchange` with both stop-limit and stop-market orders on spot and futures markets. You can use either `"limit"` or `"market"` in the `order_types.stoploss` configuration setting to select the stoploss order type.
+
 OKX requires a passphrase for each api key, you will therefore need to add this key into the configuration so your exchange section looks as follows:
 
 ```json
@@ -353,24 +356,6 @@ Bybit uses live markets to simulate your trades (without market impact) - making
 You'll need to use separate API keys for demo trading, which you can create on bybit's demo page.
 
 Demo mode is incompatible with dry-run.
-
-## Bitmart
-
-Bitmart requires the API key Memo (the name you give the API key) to go along with the exchange key and secret.
-It's therefore required to pass the UID as well.
-
-```json
-"exchange": {
-    "name": "bitmart",
-    "uid": "your_bitmart_api_key_memo",
-    "secret": "your_exchange_secret",
-    "password": "your_exchange_api_key_password",
-    // ...
-}
-```
-
-!!! Warning "Necessary Verification"
-    Bitmart requires Verification Lvl2 to successfully trade on the spot market through the API - even though trading via UI works just fine with just Lvl1 verification.
 
 ## Bitget
 

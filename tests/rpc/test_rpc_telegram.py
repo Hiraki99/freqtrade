@@ -473,7 +473,7 @@ async def test_order_handle(default_conf, update, ticker, fee, mocker) -> None:
     msg_mock.reset_mock()
 
     # Create some test data
-    freqtradebot.enter_positions()
+    freqtradebot.enter_positions(3)
 
     mocker.patch("freqtrade.rpc.telegram.MAX_MESSAGE_LENGTH", 500)
 
@@ -583,7 +583,7 @@ async def test_status_handle(default_conf, update, ticker, fee, mocker) -> None:
     msg_mock.reset_mock()
 
     # Create some test data
-    freqtradebot.enter_positions()
+    freqtradebot.enter_positions(3)
     # Trigger status while we have a fulfilled order for the open trade
     await telegram._status(update=update, context=MagicMock())
 
@@ -654,7 +654,7 @@ async def test_status_table_handle(default_conf, update, ticker, fee, mocker) ->
     msg_mock.reset_mock()
 
     # Create some test data
-    freqtradebot.enter_positions()
+    freqtradebot.enter_positions(1)
 
     await telegram._status_table(update=update, context=MagicMock())
 
@@ -917,7 +917,7 @@ async def test_telegram_profit_handle(
     msg_mock.reset_mock()
 
     # Create some test data
-    freqtradebot.enter_positions()
+    freqtradebot.enter_positions(1)
     trade = Trade.session.scalars(select(Trade)).first()
 
     context = MagicMock()
@@ -1362,7 +1362,7 @@ async def test_telegram_forceexit_handle(
     patch_get_signal(freqtradebot)
 
     # Create some test data
-    freqtradebot.enter_positions()
+    freqtradebot.enter_positions(1)
 
     trade = Trade.session.scalars(select(Trade)).first()
     assert trade
@@ -1432,7 +1432,7 @@ async def test_telegram_force_exit_down_handle(
     patch_get_signal(freqtradebot)
 
     # Create some test data
-    freqtradebot.enter_positions()
+    freqtradebot.enter_positions(1)
 
     # Decrease the price and sell it
     mocker.patch.multiple(EXMS, fetch_ticker=ticker_sell_down)
@@ -1500,7 +1500,7 @@ async def test_forceexit_all_handle(default_conf, update, ticker, fee, mocker) -
     patch_get_signal(freqtradebot)
 
     # Create some test data
-    freqtradebot.enter_positions()
+    freqtradebot.enter_positions(4)
     msg_mock.reset_mock()
 
     # /forceexit all
@@ -1590,7 +1590,7 @@ async def test_force_exit_no_pair(default_conf, update, ticker, fee, mocker) -> 
     assert msg_mock.call_args_list[0][1]["msg"] == "No open trade found."
 
     # Create some test data
-    freqtradebot.enter_positions()
+    freqtradebot.enter_positions(4)
     msg_mock.reset_mock()
 
     # /forceexit
@@ -2900,7 +2900,6 @@ async def test_telegram_list_custom_data(default_conf_usdt, update, ticker, fee,
     assert "Trade-id not set." in msg_mock.call_args_list[0][0][0]
     msg_mock.reset_mock()
 
-    #
     context.args = ["1"]
     await telegram._list_custom_data(update=update, context=context)
     assert msg_mock.call_count == 1

@@ -46,15 +46,16 @@ jobs:
 
 
     steps:
-    - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
 
     - name: Install uv and Python 🐍
-      uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
       with:
         activate-environment: true
         enable-cache: true # zizmor: ignore[cache-poisoning] - this job is not used for release builds
+        prune-cache: true
         python-version: ${{ matrix.python-version }}
         cache-dependency-glob: "requirements**.txt"
         cache-suffix: "${{ matrix.python-version }}"
@@ -77,23 +78,23 @@ jobs:
         python build_helpers/freqtrade_client_version_align.py
 
     - name: Tests
-      if: (!(runner.os == 'Linux' && matrix.python-version == '3.12' && matrix.os == 'ubuntu-24.04'))
+      if: (!(runner.os == 'Linux' && matrix.python-version == '3.14' && matrix.os == 'ubuntu-24.04'))
       run: |
         pytest --random-order --durations 20 -n auto
 
     - name: Tests with Coveralls
-      if: (runner.os == 'Linux' && matrix.python-version == '3.12' && matrix.os == 'ubuntu-24.04')
+      if: (runner.os == 'Linux' && matrix.python-version == '3.14' && matrix.os == 'ubuntu-24.04')
       run: |
         pytest --random-order --cov=freqtrade --cov=freqtrade_client --cov-config=.coveragerc
 
     - uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
-      if: (runner.os == 'Linux' && matrix.python-version == '3.12' && matrix.os == 'ubuntu-24.04')
+      if: (runner.os == 'Linux' && matrix.python-version == '3.14' && matrix.os == 'ubuntu-24.04')
       with:
         fail_ci_if_error: true
         token: ${{ secrets.CODECOV_TOKEN }}  # zizmor: ignore[secrets-outside-env] Intentionally not using environment variable.
 
     - name: Cleanup codecov dirty state files
-      if: (runner.os == 'Linux' && matrix.python-version == '3.12' && matrix.os == 'ubuntu-24.04')
+      if: (runner.os == 'Linux' && matrix.python-version == '3.14' && matrix.os == 'ubuntu-24.04')
       run: |
         # See https://github.com/codecov/codecov-action/issues/1851
         rm -rf codecov codecov.SHA256SUM codecov.SHA256SUM.sig
@@ -167,12 +168,7 @@ jobs:
       shell: pwsh
       run: |
         $PSVersionTable
-        Get-PSRepository | Format-List *
-        if (-not (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue)) {
-          Register-PSRepository -Default
-        }
-        Set-PSRepository PSGallery -InstallationPolicy Trusted
-        Install-Module -Name Pester -RequiredVersion 5.7.1 -Confirm:$false -Force -SkipPublisherCheck
+        Install-PSResource -Name Pester -Version '[5.7.1]' -TrustRepository -Reinstall
         $Error.clear()
 
         # Override Clear-Host globally to prevent headless console crashes
@@ -193,12 +189,12 @@ jobs:
     name: "Mypy Version Check"
     runs-on: ubuntu-24.04
     steps:
-    - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
 
     - name: Install uv and Python 🐍
-      uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
       with:
         activate-environment: true
         python-version: "3.13"
@@ -213,12 +209,12 @@ jobs:
     name: "Pre-commit checks"
     runs-on: ubuntu-22.04
     steps:
-    - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
 
     - name: Set up Python 🐍
-      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
       with:
         python-version: "3.13"
 
@@ -228,7 +224,7 @@ jobs:
     name: "Documentation build"
     runs-on: ubuntu-22.04
     steps:
-    - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
 
@@ -237,7 +233,7 @@ jobs:
         ./tests/test_docs.sh
 
     - name: Install uv and Python 🐍
-      uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
       with:
         activate-environment: true
         python-version: "3.13"
@@ -263,20 +259,21 @@ jobs:
     runs-on: ubuntu-24.04
     strategy:
       matrix:
-        python-version: ["3.12"]
+        python-version: ["3.14"]
     steps:
-    - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
 
     - name: Install uv and Python 🐍
-      uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
       with:
         activate-environment: true
         enable-cache: true # zizmor: ignore[cache-poisoning] - this job is not used for release builds
+        prune-cache: true
         python-version: "${{ matrix.python-version }}"
         cache-dependency-glob: "requirements**.txt"
-        cache-suffix: "3.12"
+        cache-suffix: "${{ matrix.python-version }}"
 
     - name: Installation - *nix
       run: |
@@ -332,12 +329,12 @@ jobs:
       with:
         jobs: ${{ toJSON(needs) }}
 
-    - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
 
     - name: Install uv and Python 🐍
-      uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
       with:
         activate-environment: true
         python-version: "${{ matrix.python-version }}"
@@ -381,7 +378,7 @@ jobs:
       id-token: write # Needed for pypa/gh-action-pypi-publish
 
     steps:
-    - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
 
@@ -393,7 +390,7 @@ jobs:
         merge-multiple: true
 
     - name: Publish to PyPI (Test)
-      uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
+      uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # v1.14.1
       with:
         repository-url: https://test.pypi.org/legacy/
 
@@ -410,7 +407,7 @@ jobs:
       id-token: write # Needed for pypa/gh-action-pypi-publish
 
     steps:
-    - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
 
@@ -422,7 +419,7 @@ jobs:
         merge-multiple: true
 
     - name: Publish to PyPI
-      uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
+      uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # v1.14.1
 
 
   docker-build:
