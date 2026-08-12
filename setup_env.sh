@@ -14,6 +14,7 @@
 #   ./setup_env.sh --dev        # + pytest/ruff/mypy/freqai + pre-commit hook
 #   ./setup_env.sh --check      # CHỈ kiểm tra, không cài và không sửa gì
 #   ./setup_env.sh --recreate   # xoá .venv rồi dựng lại từ đầu
+#   ./setup_env.sh --no-claude  # bỏ qua bước cài Claude Code CLI
 #
 # KHÔNG bao giờ đụng vào: .env đã có, config*.json, database *.sqlite, user_data/.
 set -euo pipefail
@@ -27,6 +28,7 @@ PY_MINORS=(14 13 12 11)          # thứ tự ưu tiên, giống SUPPORTED_MINOR
 MODE="run"                       # run | minimal | dev
 CHECK=0
 RECREATE=0
+NO_CLAUDE=0
 FAILED=0
 
 for arg in "$@"; do
@@ -35,7 +37,8 @@ for arg in "$@"; do
         --dev)      MODE="dev" ;;
         --check)    CHECK=1 ;;
         --recreate) RECREATE=1 ;;
-        -h|--help)  sed -n '2,18p' "$0"; exit 0 ;;
+        --no-claude) NO_CLAUDE=1 ;;
+        -h|--help)  sed -n '2,19p' "$0"; exit 0 ;;
         *) echo "Tham số không hợp lệ: $arg (xem --help)" >&2; exit 2 ;;
     esac
 done
@@ -216,7 +219,48 @@ ensure_strategies() {
     ok "đã đồng bộ từ strategies/"
 }
 
-# --- 7. Kiểm chứng thật ------------------------------------------------------
+# --- 7. Claude Code CLI ------------------------------------------------------
+# KHÔNG cần để chạy bot — đây là công cụ dev, nên thiếu nó chỉ cảnh báo chứ không
+# tính là hỏng. Dùng native installer (curl | bash) chứ KHÔNG dùng npm: máy này đang
+# cài kiểu native (~/.local/bin/claude -> ~/.local/share/claude/versions/<ver>), và bản
+# native tự cập nhật + không phụ thuộc phiên bản Node của nvm. Muốn bản npm thì:
+#     npm install -g @anthropic-ai/claude-code
+# Đã cài rồi thì KHÔNG chạy lại installer — nâng cấp bằng `claude update`.
+ensure_claude() {
+    step "Claude Code CLI"
+    if [[ $NO_CLAUDE -eq 1 ]]; then
+        echo "   --no-claude → bỏ qua"
+        return
+    fi
+    if command -v claude >/dev/null 2>&1; then
+        ok "đã có: $(claude --version 2>/dev/null || echo 'không đọc được version') ($(command -v claude))"
+        echo "      nâng cấp: claude update"
+        return
+    fi
+    if [[ $CHECK -eq 1 ]]; then
+        warn "chưa cài claude → chạy ./setup_env.sh (không kèm --check) hoặc bỏ qua bằng --no-claude"
+        return
+    fi
+    echo "   tải installer chính chủ: https://claude.ai/install.sh"
+    if curl -fsSL https://claude.ai/install.sh | bash; then
+        # Installer đặt binary vào ~/.local/bin — thư mục này KHÔNG mặc định nằm trong PATH
+        # của mọi shell, nên báo rõ thay vì để lệnh `claude` "không tìm thấy" sau khi cài xong.
+        export PATH="$HOME/.local/bin:$PATH"
+        if command -v claude >/dev/null 2>&1; then
+            ok "$(claude --version 2>/dev/null || echo 'đã cài')"
+            case ":${PATH}:" in
+                *":$HOME/.local/bin:"*) ;;
+                *) warn 'thêm vào ~/.zshrc: export PATH="$HOME/.local/bin:$PATH"' ;;
+            esac
+        else
+            warn 'cài xong nhưng chưa thấy lệnh — thêm vào ~/.zshrc: export PATH="$HOME/.local/bin:$PATH"'
+        fi
+    else
+        warn "cài Claude Code thất bại (không chặn phần còn lại) — xem https://code.claude.com/docs"
+    fi
+}
+
+# --- 8. Kiểm chứng thật ------------------------------------------------------
 # Không tin vào "đã cài xong" — nạp đúng thứ mà ./run_smc.sh sẽ nạp. Đây là chỗ bắt được
 # lỗi config sai schema hay strategy import hỏng, TRƯỚC khi bot chạy thật.
 verify() {
@@ -263,6 +307,7 @@ install_deps
 ensure_env
 ensure_dirs
 ensure_strategies
+ensure_claude
 verify
 
 echo
