@@ -140,8 +140,9 @@ docker-compose-*.yml
 *.bak[0-9]*
 
 # BMad
-_bmad/
 _bmad-output/
+# Personal install answers (BMad's own convention: *.user.toml is per-user)
+_bmad/**/*.user.toml
 
 # Claude
 .claude/*
