@@ -1,0 +1,63 @@
+Tổng hợp ICT Entry (M15–M5) cho Crypto Swing
+
+Workflow
+
+H4/D1: - Xác định Bias (EMA200, Elliott, Volume Profile, Market
+Structure)
+
+M15: - Liquidity Sweep - Displacement - MSS (Market Structure Shift) -
+FVG
+
+M5: - Retest FVG hoặc Order Block - Entry - SL dưới vùng sweep - TP tại
+Buy/Sell Side Liquidity tiếp theo - RR tối thiểu 1:2, ưu tiên 1:3
+
+Các kịch bản
+
+1.  Sweep → MSS → FVG (chuẩn ICT 2022)
+2.  Sweep → Order Block
+3.  Sweep → IFVG
+4.  SMT Divergence → Sweep → MSS → FVG
+5.  PDH/PDL Sweep → MSS → FVG
+6.  Killzone → Sweep → MSS → FVG
+7.  Breaker Block Retest
+8.  Unicorn Model (Breaker + FVG)
+
+Checklist
+
+-   Bias H4/D1 cùng hướng
+-   Có Liquidity Sweep
+-   Có MSS
+-   Có Displacement
+-   Có FVG hoặc OB
+-   RR >= 1:2
+-   Risk <= 1% tài khoản
+
+Indicator TradingView
+
+-   ICT Algo: Sweep + MSS + High Probability FVG
+-   Institutional Liquidity Sweep + MSS + FVG
+-   BSL/SSL + Real-Time FVG + MSS
+-   MU ICT Indicator
+-   Sweeps + FVG + IFVG
+
+GitHub / Python
+
+Từ khóa: - ICT Pine Script - Smart Money Concepts Pine - Fair Value Gap
+Pine - Order Block Pine - Liquidity Sweep Pine - Market Structure Shift
+Pine
+
+Thư viện Python: - smartmoneyconcepts - swing_highs_lows() - fvg() -
+bos_choch() - ob() - liquidity()
+
+Bộ indicator khuyến nghị
+
+1.  LuxAlgo SMC (trả phí)
+2.  ICT Algo: Sweep + MSS + High Probability FVG
+3.  Institutional Liquidity Sweep + MSS + FVG
+4.  BSL/SSL + MSS + FVG
+5.  MU ICT Indicator
+
+Bộ quy tắc tối giản
+
+EMA200 (H4) ↓ Liquidity Sweep ↓ Displacement ↓ MSS ↓ FVG ↓ Order Block ↓
+Entry ↓ ATR Stop ↓ RR 1:3

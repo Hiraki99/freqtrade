@@ -5,10 +5,11 @@ This module manage Telegram communication
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import re
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -55,6 +56,18 @@ from freqtrade.util.datetime_helpers import dt_now
 
 
 MAX_MESSAGE_LENGTH = MessageLimit.MAX_TEXT_LENGTH
+
+# /smc không tham số: báo cáo nhanh 4 cặp cố định (xem `_smc`).
+# Khác /analysis — lệnh đó phân tích 1 cặp trên nhiều khung.
+SMC_QUICK_BASES = ("BTC", "ETH", "XAU", "SOL")
+# Khung dự phòng khi không đọc được khung giao dịch của bot (xem `_smc_quick_timeframes`).
+SMC_QUICK_TIMEFRAME = "4h"
+
+# /scalp: cùng 4 cặp nhưng khung ngắn, cho lệnh trong ngày.
+# THỨ TỰ THẤP -> CAO LÀ BẮT BUỘC: `_smc_signal_report` lấy avail[0] làm khung dựng kế hoạch
+# Entry/SL/TP và avail[-1] làm khung bias. Đảo thành ("15m", "5m") sẽ ra bias 5m + kế hoạch
+# 15m — ngược hẳn ý đồ scalping.
+SMC_SCALP_TIMEFRAMES = ("5m", "15m")
 
 
 logger = logging.getLogger(__name__)
@@ -154,6 +167,7 @@ class Telegram(RPCHandler):
 
         self._app: Application
         self._loop: asyncio.AbstractEventLoop
+        self._shutdown_event: asyncio.Event
         self._init_keyboard()
         self._start_thread()
 
@@ -171,8 +185,8 @@ class Telegram(RPCHandler):
         """
         self._keyboard: list[list[str | KeyboardButton]] = [
             ["/daily", "/profit", "/balance"],
-            ["/status", "/status table", "/performance"],
-            ["/count", "/start", "/stop", "/help"],
+            ["/status", "/status table"],
+            ["/start", "/stop", "/help"],
         ]
         # do not allow commands with mandatory arguments and critical cmds
         # TODO: DRY! - its not good to list all valid cmds here. But otherwise
@@ -185,7 +199,6 @@ class Telegram(RPCHandler):
             r"/status$",
             r"/status table$",
             r"/trades$",
-            r"/performance$",
             r"/buys",
             r"/entries",
             r"/sells",
@@ -193,10 +206,13 @@ class Telegram(RPCHandler):
             r"/mix_tags",
             r"/daily$",
             r"/daily \d+$",
+            r"/analysis$",
+            r"/analysis [\w/]+$",
+            r"/smc$",
+            r"/scalp$",
             r"/profit([_ ]long|[_ ]short)?$",
             r"/profit([_ ]long|[_ ]short)? \d+$",
             r"/stats$",
-            r"/count$",
             r"/locks$",
             r"/balance$",
             r"/stopbuy$",
@@ -261,6 +277,9 @@ class Telegram(RPCHandler):
             self._loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self._loop)
 
+        # Tín hiệu dừng polling — set từ cleanup() (thread khác) qua loop này.
+        self._shutdown_event = asyncio.Event()
+
         self._app = self._init_telegram_app()
 
         # Register command handler and start telegram message polling
@@ -282,15 +301,16 @@ class Telegram(RPCHandler):
             CommandHandler("trades", self._trades),
             CommandHandler("delete", self._delete_trade),
             CommandHandler(["coo", "cancel_open_order"], self._cancel_open_order),
-            CommandHandler("performance", self._performance),
             CommandHandler(["buys", "entries"], self._enter_tag_performance),
             CommandHandler(["sells", "exits"], self._exit_reason_performance),
             CommandHandler("mix_tags", self._mix_tag_performance),
             CommandHandler("stats", self._stats),
             CommandHandler("daily", self._daily),
+            CommandHandler("analysis", self._analysis),
+            CommandHandler("smc", self._smc),
+            CommandHandler("scalp", self._scalp),
             CommandHandler("weekly", self._weekly),
             CommandHandler("monthly", self._monthly),
-            CommandHandler("count", self._count),
             CommandHandler("locks", self._locks),
             CommandHandler(["unlock", "delete_locks"], self._delete_locks),
             CommandHandler(["reload_config", "reload_conf"], self._reload_config),
@@ -319,7 +339,6 @@ class Telegram(RPCHandler):
             CallbackQueryHandler(self._profit_short, pattern="update_profit_short"),
             CallbackQueryHandler(self._profit, pattern=r"update_profit$"),
             CallbackQueryHandler(self._balance, pattern="update_balance"),
-            CallbackQueryHandler(self._performance, pattern="update_performance"),
             CallbackQueryHandler(
                 self._enter_tag_performance, pattern="update_enter_tag_performance"
             ),
@@ -327,7 +346,6 @@ class Telegram(RPCHandler):
                 self._exit_reason_performance, pattern="update_exit_reason_performance"
             ),
             CallbackQueryHandler(self._mix_tag_performance, pattern="update_mix_tag_performance"),
-            CallbackQueryHandler(self._count, pattern="update_count"),
             CallbackQueryHandler(self._force_exit_inline, pattern=r"force_exit__\S+"),
             CallbackQueryHandler(self._force_enter_inline, pattern=r"force_enter__\S+"),
         ]
@@ -366,15 +384,26 @@ class Telegram(RPCHandler):
                 timeout=20,
                 drop_pending_updates=True,
             )
-            while True:
-                await asyncio.sleep(10)
-                if not self._app.updater.running:
-                    break
+            # Task nền: tự động gửi /analysis theo lịch cố định (nếu bật config).
+            sched_task = asyncio.create_task(self._analysis_schedule_loop())
+            # Chờ tín hiệu dừng (cleanup) HOẶC updater tự dừng (polling lỗi).
+            while not self._shutdown_event.is_set() and self._app.updater.running:
+                try:
+                    await asyncio.wait_for(self._shutdown_event.wait(), timeout=10)
+                except TimeoutError:
+                    continue
+            sched_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await sched_task
+            # Teardown TRỌN VẸN trong loop này -> hoàn tất stop/shutdown trước
+            # khi loop dừng, tránh "cannot schedule new futures after shutdown".
+            await self._cleanup_telegram()
 
     async def _cleanup_telegram(self) -> None:
-        if self._app.updater:
+        if self._app.updater and self._app.updater.running:
             await self._app.updater.stop()
-        await self._app.stop()
+        if self._app.running:
+            await self._app.stop()
         await self._app.shutdown()
 
     def cleanup(self) -> None:
@@ -382,8 +411,10 @@ class Telegram(RPCHandler):
         Stops all running telegram threads.
         :return: None
         """
+        # Báo cho vòng lặp polling dừng; teardown chạy trong _startup_telegram.
         # This can take up to `timeout` from the call to `start_polling`.
-        asyncio.run_coroutine_threadsafe(self._cleanup_telegram(), self._loop)
+        if self._loop.is_running():
+            self._loop.call_soon_threadsafe(self._shutdown_event.set)
         self._thread.join()
 
     def _exchange_from_msg(self, msg: RPCOrderMsg) -> str:
@@ -990,6 +1021,1362 @@ class Telegram(RPCHandler):
         :return: None
         """
         await self._timeunit_stats(update, context, "days")
+
+    @staticmethod
+    def _smc_parse_args(
+        args: list[str], whitelist: list[str], stake: str, default_tfs: Sequence[str] | None = None
+    ):
+        """Tách `/smc [pair] [tf ...]` -> (pair, danh sách khung không trùng)."""
+        tf_re = re.compile(r"^\d+[mhdwM]$")
+        pair: str | None = None
+        tfs: list[str] = []
+        for a in args or []:
+            if tf_re.match(a):
+                tfs.append(a)
+            elif pair is None:
+                pair = a.upper()
+        if pair is None:
+            pair = whitelist[0] if whitelist else f"BTC/{stake}"
+        if "/" not in pair:
+            pair = f"{pair}/{stake}"
+        if not tfs:
+            tfs = list(default_tfs or ["15m", "1h", "4h", "1d"])
+        # dict.fromkeys: khử trùng lặp NHƯNG giữ nguyên thứ tự khung user gõ.
+        return pair, list(dict.fromkeys(tfs))
+
+    @staticmethod
+    def _smc_indicator_line(r, price: float, val) -> str:
+        """Dòng chỉ báo THAM KHẢO (RSI/EMA/MA/MACD) cho 1 khung.
+
+        Chỉ hiển thị, không ảnh hưởng tín hiệu vào lệnh. Trả "" nếu strategy
+        chưa có các cột chỉ báo (vd bot chạy bản cũ chưa reload).
+        """
+        rsi = val(r.get("rsi"))
+        if rsi is None:
+            return ""
+        parts = []
+        # RSI: 🟢 quá bán (<=30), 🔴 quá mua (>=70), ⚪ trung tính.
+        r_emoji = "🟢" if rsi <= 30 else "🔴" if rsi >= 70 else "⚪"
+        parts.append(f"RSI {rsi:.0f}{r_emoji}")
+        # EMA: giá so với EMA50 và EMA200 (xu hướng).
+        e50, e200 = val(r.get("ema50")), val(r.get("ema200"))
+        if e50 is not None and e200 is not None:
+            l50 = "🟢" if price >= e50 else "🔴"
+            l200 = "🟢" if price >= e200 else "🔴"
+            parts.append(f"EMA {l50}{l200}")
+        # MA20: giá so với SMA20.
+        sma = val(r.get("sma20"))
+        if sma is not None:
+            parts.append(f"MA20 {'🟢' if price >= sma else '🔴'}")
+        # MACD: đường MACD so với signal.
+        macd, sigl = val(r.get("macd")), val(r.get("macdsignal"))
+        if macd is not None and sigl is not None:
+            parts.append(f"MACD {'🟢' if macd >= sigl else '🔴'}")
+        return " · ".join(parts)
+
+    @staticmethod
+    def _smc_drop_unclosed(df, tf: str):
+        """Bỏ nến đang hình thành -> chỉ phân tích trên NẾN ĐÃ ĐÓNG gần nhất."""
+        import time
+
+        from freqtrade.exchange import timeframe_to_seconds
+
+        if df is None or len(df) == 0 or "date" not in df.columns:
+            return df
+        last_open = df["date"].iloc[-1].timestamp()
+        if last_open + timeframe_to_seconds(tf) > time.time():
+            return df.iloc[:-1]
+        return df
+
+    def _smc_live_price(self, ft, pair: str):
+        """Giá khớp gần nhất từ ticker CÔNG KHAI (không cần API key)."""
+        try:
+            t = ft.exchange.fetch_ticker(pair)
+            v = t.get("last") or t.get("close")
+            return float(v) if v else None
+        except Exception as e:
+            logger.warning(f"/smc ticker {pair}: {type(e).__name__}: {e}")
+            return None
+
+    def _smc_tf_line(self, ft, pair: str, tf: str, candle_type):
+        """Phân tích 1 khung trên nến đóng gần nhất -> (dòng, điểm, giá, levels).
+
+        Luôn fetch OHLCV mới tại thời điểm gọi để dùng nến gần nhất của khung
+        (tránh dataframe cũ của bot); lỗi thì lùi về dataframe đã phân tích.
+        Entry & vị trí (discount/premium, in-OB) tính theo GIÁ ĐÓNG của nến đã
+        đóng — KHÔNG theo giá hiện tại (giá live chỉ hiển thị ở tiêu đề).
+        """
+        import time
+
+        from freqtrade.exchange import timeframe_to_seconds
+
+        def val(v):
+            return None if v is None or (isinstance(v, float) and v != v) else v
+
+        def lab(b):
+            b = val(b) or 0
+            return "🟢" if b > 0 else "🔴" if b < 0 else "⚪"
+
+        try:
+            need = (ft.strategy.startup_candle_count or 300) + 50
+            since_ms = int((time.time() - need * timeframe_to_seconds(tf)) * 1000)
+            df = ft.exchange.get_historic_ohlcv(
+                pair=pair, timeframe=tf, since_ms=since_ms, candle_type=candle_type
+            )
+            if df is not None and len(df):
+                df = self._smc_drop_unclosed(df, tf)
+                meta = {"pair": pair}
+                df = ft.strategy.populate_entry_trend(
+                    ft.strategy.populate_indicators(df, meta), meta
+                )
+            else:
+                # Fallback: dataframe đã phân tích của bot (có thể cũ hơn).
+                df, _ = ft.dataprovider.get_analyzed_dataframe(pair, tf)
+            if df is None or len(df) == 0:
+                return f"`{tf:>3}` ⚠️ chưa có dữ liệu", None, None, {}
+        except Exception as e:
+            logger.warning(f"/smc {pair} {tf}: {type(e).__name__}: {e}")
+            return f"`{tf:>3}` ⚠️ lỗi ({type(e).__name__})", None, None, {}
+
+        r = df.iloc[-1]
+        # Entry & vị trí tính theo NẾN ĐÓNG (không theo giá hiện tại).
+        price = float(r["close"])
+        sw = val(r.get("swing_trend")) or 0
+        zone = ""
+        sh, sl = val(r.get("swing_high")), val(r.get("swing_low"))
+        if sh and sl:
+            zone = " · DISCOUNT" if price < (sh + sl) / 2 else " · PREMIUM"
+        bt, bb = val(r.get("bull_ob_top")), val(r.get("bull_ob_bot"))
+        in_ob = " · trong Bull OB" if (bt and bb and bb <= price <= bt) else ""
+        sig = " ✅LONG" if val(r.get("enter_long")) else ""
+        line = f"`{tf:>3}` Swing {lab(sw)} Internal {lab(r.get('internal_trend'))}"
+        line += f"{zone}{in_ob}{sig}"
+        ind = self._smc_indicator_line(r, price, val)
+        if ind:
+            line += f"\n     {ind}"
+        # Các mức SMC để dựng kế hoạch Entry-Target.
+        levels = self._smc_levels_from_row(r, df)
+        return line, (1 if sw > 0 else -1 if sw < 0 else 0), price, levels
+
+    @classmethod
+    def _smc_levels_from_row(cls, r, df) -> dict:
+        """Bóc các mức SMC từ MỘT hàng của dataframe đã phân tích.
+
+        Tách khỏi `_smc_tf_line` (vốn gắn liền với việc fetch nến live) để mô phỏng ngoại
+        tuyến chấm được đúng thứ mà bot chấm: cùng hàm, cùng khoá, nên kết quả mô phỏng và
+        kết quả chạy thật không thể lệch nhau vì một bên quên một mức nào đó.
+
+        :param r: một hàng đã qua populate_indicators + populate_entry_trend
+        :param df: dataframe chứa hàng đó, cắt tới đúng thời điểm cần chấm (dùng cho pivots)
+        """
+
+        def val(v):
+            return None if v is None or (isinstance(v, float) and v != v) else v
+
+        sw = val(r.get("swing_trend")) or 0
+        return {
+            "internal_trend": val(r.get("internal_trend")) or 0,
+            "swing_trend": sw,
+            "enter_long": bool(val(r.get("enter_long"))),
+            "enter_short": bool(val(r.get("enter_short"))),
+            "bull_ob_top": val(r.get("bull_ob_top")),
+            "bull_ob_bot": val(r.get("bull_ob_bot")),
+            "sw_bull_ob_top": val(r.get("sw_bull_ob_top")),
+            "sw_bull_ob_bot": val(r.get("sw_bull_ob_bot")),
+            "fvg_top": val(r.get("fvg_top")),
+            "fvg_bot": val(r.get("fvg_bot")),
+            "swing_high": val(r.get("swing_high")),
+            "swing_low": val(r.get("swing_low")),
+            # ATR dùng dựng dải entry khi không có OB/FVG nào (thay vì trả một điểm).
+            "atr": val(r.get("atr")),
+            "equilibrium": val(r.get("equilibrium")),
+            "premium_level": val(r.get("premium_level")),
+            "bear_ob_top": val(r.get("bear_ob_top")),
+            "bear_ob_bot": val(r.get("bear_ob_bot")),
+            # Volume Profile (smcv2.md mục F) — POC là magnet giá, VAH/VAL là biên
+            # value area 70%. Dùng làm mốc chốt lời có cơ sở khối lượng thật.
+            "vp_poc": val(r.get("vp_poc")),
+            "vp_vah": val(r.get("vp_vah")),
+            "vp_val": val(r.get("vp_val")),
+            # Chuỗi pivot gần nhất để ước lượng sóng Elliott.
+            "pivots": cls._smc_extract_pivots(df),
+            # Chỉ báo tham khảo (cho phần Bằng chứng).
+            "rsi": val(r.get("rsi")),
+            "ema50": val(r.get("ema50")),
+            "ema200": val(r.get("ema200")),
+            "sma20": val(r.get("sma20")),
+            "macd": val(r.get("macd")),
+            "macdsignal": val(r.get("macdsignal")),
+        }
+
+    @staticmethod
+    def _smc_extract_pivots(df, n: int = 7) -> list[dict]:
+        """Trích chuỗi pivot swing (H/L) gần nhất từ cột swing_high/swing_low.
+
+        Mỗi lần giá trị forward-fill đổi = một pivot mới được xác nhận.
+        """
+        piv: list[tuple[int, str, float]] = []
+        for col, typ in (("swing_high", "H"), ("swing_low", "L")):
+            if col not in df.columns:
+                continue
+            prev = None
+            for pos, v in enumerate(df[col].to_numpy()):
+                if v is not None and v == v and v != prev:  # v==v: loại NaN
+                    piv.append((pos, typ, float(v)))
+                    prev = v
+        piv.sort(key=lambda x: x[0])
+        return [{"type": t, "price": p} for _, t, p in piv[-n:]]
+
+    @classmethod
+    def _smc_wave_estimate(cls, pivots, swing_trend) -> str | None:
+        """Ước lượng vị trí sóng Elliott từ số chân sóng sau pivot cực trị.
+
+        Heuristic: đếm số chân sóng kể từ đáy (uptrend) / đỉnh (downtrend) gần
+        nhất. 1-5 = sóng đẩy (lẻ=đẩy, chẵn=hồi); >5 = điều chỉnh A-B-C.
+        """
+        if not pivots or len(pivots) < 2 or not swing_trend:
+            return None
+        up = swing_trend > 0
+        prices = [p["price"] for p in pivots]
+        base_i = prices.index(min(prices)) if up else prices.index(max(prices))
+        legs = len(pivots) - 1 - base_i
+        if legs <= 0:
+            return None
+        trend = "TĂNG" if up else "GIẢM"
+        if legs <= 5:
+            kind = "đẩy" if legs % 2 == 1 else "hồi"
+            extra = " — sóng đẩy cuối, cảnh giác đảo chiều" if legs == 5 else ""
+            return f"ước lượng đang ở SÓNG {legs} ({kind}) của nhịp {trend}{extra}."
+        abc = ("A", "B", "C")[min(legs - 6, 2)]
+        return f"đã qua 5 sóng đẩy {trend} — ước lượng đang ở SÓNG {abc} của điều chỉnh A-B-C."
+
+    @staticmethod
+    def _smc_fmt_price(x: float) -> str:
+        """Định dạng giá theo độ lớn (tránh ký hiệu khoa học cho coin giá cao/thấp)."""
+        ax = abs(x)
+        if ax >= 1000:
+            return f"{x:,.0f}"
+        if ax >= 1:
+            return f"{x:.2f}"
+        if ax >= 0.01:
+            return f"{x:.4f}"
+        return f"{x:.8f}".rstrip("0").rstrip(".")
+
+    @classmethod
+    def _smc_entry_zone(
+        cls, lv: dict, price: float, direction: str = "long"
+    ) -> tuple[float, float, str, float | None]:
+        """Chọn VÙNG entry — luôn trả một KHOẢNG a-b, không bao giờ một điểm.
+
+        LONG: Bull OB nội bộ → Swing OB → FVG → dải quanh giá.
+        SHORT: Bear OB → dải quanh giá.
+        Khi không có mốc cấu trúc nào, dựng dải ±0.25 ATR quanh giá thay vì trả
+        "thị trường" — vào lệnh cần một khoảng để đặt limit, không phải một điểm.
+        :return: (lo, hi, nhãn vùng, mức vô hiệu hóa)
+                 Mức vô hiệu hóa = biên OB phía rủi ro (đáy OB cho LONG, đỉnh OB
+                 cho SHORT) — nơi đặt SL; None khi chỉ là dải quanh giá.
+        """
+        if direction == "long":
+            zones = [
+                ("Bull OB", lv.get("bull_ob_bot"), lv.get("bull_ob_top")),
+                ("Swing OB", lv.get("sw_bull_ob_bot"), lv.get("sw_bull_ob_top")),
+                ("FVG", lv.get("fvg_bot"), lv.get("fvg_top")),
+            ]
+        else:
+            # Chỉ có Bear OB: strategy chưa xuất swing-bear-OB và FVG giảm.
+            zones = [("Bear OB", lv.get("bear_ob_bot"), lv.get("bear_ob_top"))]
+        for name, bot, top in zones:
+            if bot and top and bot <= top:
+                inval = bot if direction == "long" else top
+                return bot, top, name, inval
+
+        atr = lv.get("atr")
+        if atr and atr > 0:
+            half, note = 0.25 * atr, "dải ±0.25 ATR quanh giá TT"
+        else:
+            half, note = 0.0015 * price, "dải ±0.15% quanh giá TT"
+        return price - half, price + half, note, None
+
+    @staticmethod
+    def _smc_price_vs_zone(cur: float, lo: float, hi: float) -> str:
+        """Vị trí giá hiện tại so với vùng entry — vào được ngay hay còn phải chờ."""
+        if lo <= cur <= hi:
+            return "✅ ĐANG trong vùng entry"
+        if cur > hi:
+            return f"trên vùng {(cur / hi - 1) * 100:.1f}% — chờ giá hồi xuống"
+        return f"dưới vùng {(lo / cur - 1) * 100:.1f}% — chờ giá hồi lên"
+
+    @classmethod
+    def _smc_break_note(cls, direction: str, price, live_price, stop, lv: dict) -> str | None:
+        """Phân biệt QUÉT thanh khoản (sweep/wick) vs GÃY cấu trúc (nến đóng).
+
+        SMC: chỉ coi setup mất hiệu lực khi NẾN ĐÓNG vượt SL. Giá live/wick vượt
+        SL rồi về lại OB là sweep -> setup VẪN hợp lệ (thường là điểm vào đẹp).
+        :param price: giá ĐÓNG nến gần nhất; :param live_price: giá khớp hiện tại.
+        """
+        if not stop:
+            return None
+        long = direction == "long"
+        fmt = cls._smc_fmt_price
+        closed_break = price <= stop if long else price >= stop
+        live_poke = bool(live_price) and (live_price <= stop if long else live_price >= stop)
+
+        if closed_break:
+            if long:
+                return (
+                    f"❌ *Nến đã ĐÓNG dưới SL {fmt(stop)}* — cấu trúc tăng GÃY (BOS giảm).\n"
+                    "👉 Nhận xét: setup LONG mất hiệu lực, nghiêng GIẢM — đứng ngoài / canh SHORT."
+                )
+            return (
+                f"❌ *Nến đã ĐÓNG trên SL {fmt(stop)}* — cấu trúc giảm GÃY (BOS tăng).\n"
+                "👉 Nhận xét: setup SHORT mất hiệu lực, nghiêng TĂNG — đứng ngoài / canh LONG."
+            )
+
+        if not live_poke:
+            return None
+
+        # Live/wick vượt SL nhưng nến CHƯA đóng phá -> có thể là sweep thanh khoản.
+        if long:
+            bt, bb = lv.get("bull_ob_top"), lv.get("bull_ob_bot")
+        else:
+            bt, bb = lv.get("bear_ob_top"), lv.get("bear_ob_bot")
+        reclaim = bool(bt and bb and bb <= live_price <= bt)
+        tail = (
+            " Giá đã về lại trong OB → khả năng SWEEP cao (bẫy giá); nếu nến ĐÓNG giữ "
+            "trong OB thì setup VẪN HỢP LỆ — thường là điểm vào đẹp sau quét."
+            if reclaim
+            else " Chờ NẾN ĐÓNG: đóng phá SL = gãy; quét rồi đóng lại trong OB = sweep (hợp lệ)."
+        )
+        side = "dưới" if long else "trên"
+        return (
+            f"⚠️ *Giá live {fmt(live_price)} đang QUÉT {side} SL {fmt(stop)}* — "
+            f"CHƯA xác nhận gãy (mới là wick).{tail}"
+        )
+
+    @staticmethod
+    def _smc_trend_word(v) -> str:
+        v = v or 0
+        return "Tăng" if v > 0 else "Giảm" if v < 0 else "Đi ngang"
+
+    @classmethod
+    def _smc_liquidity_targets(
+        cls, lv: dict, entry_ref: float, direction: str
+    ) -> list[tuple[float, str]]:
+        """Mốc chốt lời theo THANH KHOẢN / CẤU TRÚC — đúng chuẩn SMC.
+
+        `docs/ict/ICT_M15_M5_Entry_Guide.txt:11-12` chỉ định TP tại Buy/Sell-side
+        Liquidity kế tiếp; `docs/smcv2.md:164` nêu "vùng thanh khoản đối diện
+        (đỉnh/đáy cũ, EQH/EQL)". Khác hẳn Fib extension: mỗi mốc ở đây là nơi có
+        LÝ DO để giá phản ứng (lệnh chờ, cụm stop, mất cân bằng chưa lấp, khối
+        lượng tích tụ) — không phải kết quả của một phép nhân dải swing.
+        :return: [(giá, lý do)] — chỉ những mốc nằm PHÍA TRƯỚC theo hướng lệnh.
+        """
+        long = direction == "long"
+        out: list[tuple[float, str]] = []
+
+        def add(level, label: str) -> None:
+            if not level or level <= 0:
+                return
+            if (level > entry_ref) if long else (level < entry_ref):
+                out.append((float(level), label))
+
+        # 1) Đỉnh/đáy cũ = BSL/SSL — mục tiêu SMC kinh điển (từ chuỗi pivot thật).
+        want = "H" if long else "L"
+        for p in lv.get("pivots") or []:
+            if p.get("type") == want:
+                add(p.get("price"), "đỉnh cũ (BSL)" if long else "đáy cũ (SSL)")
+
+        # 2) OB ĐỐI DIỆN — nơi phe ngược chiều đặt lệnh chờ.
+        if long:
+            add(lv.get("bear_ob_bot"), "biên Bear OB (cung)")
+        else:
+            add(lv.get("bull_ob_top"), "biên Bull OB (cầu)")
+
+        # 3) FVG chưa lấp — lấp đầy mất cân bằng (biên xa = lấp trọn).
+        add(lv.get("fvg_top") if long else lv.get("fvg_bot"), "lấp trọn FVG")
+
+        # 4) Volume Profile — POC là magnet, VAH/VAL là biên value area 70%.
+        add(lv.get("vp_poc"), "POC (magnet khối lượng)")
+        if long:
+            add(lv.get("vp_vah"), "VAH (biên value area)")
+        else:
+            add(lv.get("vp_val"), "VAL (biên value area)")
+
+        # 5) Equilibrium 50% dải swing — mốc cân bằng premium/discount.
+        add(lv.get("equilibrium"), "equilibrium 50%")
+
+        # 6) Đỉnh/đáy SWING của dải hiện tại — cũng là BSL/SSL thật, chỉ khác nguồn
+        # với chuỗi pivot ở (1). Đây là mốc Fib 1.0 cũ: giữ lại vì nó là mức giá
+        # CÓ THẬT trên biểu đồ, khác hẳn 1.272/1.618 vốn chỉ là phép nhân dải swing.
+        add(
+            lv.get("swing_high") if long else lv.get("swing_low"),
+            "đỉnh swing (BSL)" if long else "đáy swing (SSL)",
+        )
+        return out
+
+    @classmethod
+    def _smc_tp_ladder(
+        cls,
+        lv: dict,
+        entry_ref: float,
+        entry_worst: float,
+        rr_risk: float | None,
+        direction: str,
+        max_rows: int = 6,
+        max_r: float = 8.0,
+        max_pct: float = 0.25,
+        min_r: float = 0.5,
+    ) -> tuple[list[tuple[float, str]], list[tuple[float, str]], list[tuple[float, str]]]:
+        """Thang TP CHỈ gồm mốc thanh khoản/cấu trúc CÓ THẬT trên biểu đồ.
+
+        Đã bỏ hoàn toàn hai nguồn ngoại suy từng có ở đây: Fib extension
+        1.272/1.618 và mốc tổng hợp "R:R 1:2". Không có lệnh chờ, cụm stop hay
+        mất cân bằng nào nằm ở những mức đó — đưa vào thang chỉ khiến R:R trông
+        đẹp hơn thực tế. Khi cấu trúc thật không với tới `min_rr`R thì kết luận
+        đúng là BỎ LỆNH (`_smc_plan_notes`), không phải vẽ thêm mốc cho đủ.
+
+        MỐC SO SÁNH LÀ `entry_worst`, KHÔNG phải `entry_ref`: mốc nằm giữa mép
+        xấu nhất và tâm vùng trông như "phía trước" nếu đo từ tâm, nhưng khi khớp
+        ở mép xấu nhất thì nó nằm SAU LƯNG — thực đo SOL/USDT ra TP1 `74.10` cho
+        SHORT có mép bán 73.88, tức lệnh LỖ mà bảng vẫn ghi "0.0R" vì lấy trị
+        tuyệt đối. Lọc theo mép xấu nhất thì mọi mốc còn lại chắc chắn có lời.
+
+        SÀN `min_r`: mốc dưới `min_r`R không tương xứng với SL — chốt ở đó ăn vài
+        phần mười R trong khi vẫn ôm rủi ro 1R. TRẦN `max_r` (hoặc `max_pct` khi
+        chưa có SL): mốc xa hơn tuy vẫn đúng cấu trúc nhưng vô dụng để lập kế
+        hoạch — thực đo BTC/USDT 4h ra đỉnh cũ ở +41.5% (13R). Cả hai nhóm bị
+        loại đều KHÔNG bị giấu: trả về ở phần tử 2 & 3 để ghi chú nói rõ.
+        :return: (thang TP [(giá, lý do)] sắp gần→xa, mốc bỏ vì quá xa,
+                 mốc bỏ vì quá gần so với SL)
+        """
+        long = direction == "long"
+        # entry_worst: mốc duy nhất đảm bảo "có lời" dù khớp ở đâu trong vùng.
+        targets = list(cls._smc_liquidity_targets(lv, entry_worst, direction))
+
+        # Trần khoảng cách. Đo bằng bội số R khi đã có SL, không thì bằng % giá.
+        if rr_risk:
+            over = lambda p: abs(p - entry_worst) / rr_risk > max_r  # noqa: E731
+        else:
+            over = lambda p: abs(p / entry_ref - 1) > max_pct  # noqa: E731
+        dropped = sorted(
+            (t for t in targets if over(t[0])),
+            key=lambda x: abs(x[0] - entry_worst),
+        )
+        targets = [t for t in targets if not over(t[0])]
+
+        # Sàn: chỉ áp được khi đã biết SL, vì "nhỏ" là nhỏ SO VỚI rủi ro.
+        too_close: list[tuple[float, str]] = []
+        if rr_risk:
+            under = lambda p: abs(p - entry_worst) / rr_risk < min_r  # noqa: E731
+            too_close = sorted(
+                (t for t in targets if under(t[0])),
+                key=lambda x: -abs(x[0] - entry_worst),
+            )
+            targets = [t for t in targets if not under(t[0])]
+
+        # Sắp gần→xa rồi gộp mốc trùng (<0.15%): nhiều nguồn cùng trỏ một giá
+        # = mốc MẠNH hơn, nên nối lý do lại thay vì hiện hai dòng.
+        merged: list[tuple[float, str]] = []
+        for t, name in sorted(targets, key=lambda x: x[0], reverse=not long):
+            if merged and abs(t / merged[-1][0] - 1) < 0.0015:
+                merged[-1] = (merged[-1][0], f"{merged[-1][1]} + {name}")
+                continue
+            merged.append((t, name))
+
+        # Mốc cấu trúc XA NHẤT nằm cuối thang, nên cắt thô merged[:max_rows] sẽ
+        # giấu mất nó — đúng mục tiêu tốt nhất, và là mốc quyết định R:R xa.
+        far = merged[-1][0] if merged else None
+        return cls._smc_trim_ladder(merged, max_rows, [far]), dropped, too_close
+
+    @staticmethod
+    def _smc_trim_ladder(
+        merged: list[tuple[float, str]], max_rows: int, must: list[float | None]
+    ) -> list[tuple[float, str]]:
+        """Cắt thang TP xuống `max_rows` nhưng LUÔN giữ các mốc trong `must`.
+
+        Phần còn lại lấy các mốc GẦN entry nhất (đã sắp gần→xa từ trước).
+        """
+        if len(merged) <= max_rows:
+            return merged
+        wanted = [m for m in must if m]
+        keep = [
+            i for i, (p, _) in enumerate(merged) if any(abs(p / m - 1) < 0.0015 for m in wanted)
+        ]
+        rest = [i for i in range(len(merged)) if i not in keep]
+        chosen = set(keep[:max_rows]) | set(rest[: max(0, max_rows - len(keep))])
+        return [merged[i] for i in sorted(chosen)]
+
+    @classmethod
+    def _smc_trade_decision(cls, strategy, lv: dict, price: float, direction: str | None) -> dict:
+        """Quyết định giao dịch dạng DỮ LIỆU: vùng entry, SL, thang TP, và có vào lệnh hay không.
+
+        Tách khỏi `_smc_plan_block` để báo cáo gửi đi và lệnh vào tự động
+        (`_auto_entry_from_analysis`) dùng CHUNG một phép tính. Nếu hai bên tự tính riêng, sẽ
+        có ngày tin nhắn ghi "BỎ LỆNH" mà bot vẫn vào lệnh — kiểu sai lệch đó không có gì
+        trong log báo cho ai biết.
+
+        `reject` khác None nghĩa là KHÔNG được vào lệnh, kèm lý do đọc được cho người dùng.
+
+        :param strategy: strategy đang chạy (lấy `sl_buffer_pct`)
+        :param lv: các mốc SMC của khung dựng kế hoạch
+        :param price: giá nến đóng của khung đó
+        :param direction: "long" | "short" | None (các khung xung đột)
+        :return: dict quyết định; `reject=None` là được phép vào lệnh
+        """
+        # Ngưỡng R:R để một setup được coi là đáng vào. Lấy theo TỪNG BOT qua
+        # `telegram.min_rr`, mặc định 2.0 như trước. Bot scalping cần ngưỡng thấp hơn: mốc
+        # thanh khoản trên khung 5m nằm gần nhau, đòi 1:2 thì gần như mọi setup đều bị BỎ LỆNH.
+        # Cái giá của ngưỡng thấp là tỉ lệ thắng phải cao hơn tương ứng mới hòa vốn.
+        #
+        # Kiểm KIỂU chứ không bọc try/except: `float()` nuốt gọn mọi thứ có `__float__`, và
+        # MagicMock có sẵn `__float__` trả về 1.0 — một strategy giả sẽ âm thầm hạ ngưỡng
+        # xuống 1:1 mà không hàm nào ném lỗi để lộ ra. Chuỗi "1.5" cũng bị từ chối: ngưỡng
+        # rủi ro sai kiểu phải rơi về mặc định an toàn, không phải được đoán ý.
+        min_rr = 2.0
+        cfg = getattr(strategy, "config", None)
+        tg = cfg.get("telegram") if isinstance(cfg, dict) else None
+        cfg_rr = tg.get("min_rr") if isinstance(tg, dict) else None
+        if isinstance(cfg_rr, (int, float)) and not isinstance(cfg_rr, bool) and cfg_rr > 0:
+            min_rr = float(cfg_rr)
+        base_out: dict = {
+            "min_rr": min_rr,
+            "direction": direction,
+            "lo": 0.0,
+            "hi": 0.0,
+            "entry_note": "",
+            "inval": None,
+            "entry_ref": 0.0,
+            "entry_worst": 0.0,
+            "stop": None,
+            "sl_note": "",
+            "rr_risk": None,
+            "targets": [],
+            "dropped": [],
+            "too_close": [],
+            "rr_first": None,
+            "reject": None,
+        }
+        if not direction or not price:
+            return {**base_out, "reject": "các khung xung đột / thiếu dữ liệu"}
+
+        long = direction == "long"
+        lo, hi, entry_note, inval = cls._smc_entry_zone(lv, price, direction)
+        entry_ref = (lo + hi) / 2
+        # Mép xấu nhất: LONG mua ở đỉnh vùng, SHORT bán ở đáy vùng.
+        entry_worst = hi if long else lo
+
+        try:
+            buf = float(strategy.sl_buffer_pct.value)
+        except Exception:
+            buf = 0.5
+
+        # SL đặt ngay ngoài BIÊN OB entry (vô hiệu hóa setup), KHÔNG theo đỉnh/đáy
+        # swing xa -> tránh SL quá dài. Fallback swing khi chỉ có dải quanh giá.
+        rr_risk = None
+        stop = None
+        base = inval if inval else lv.get("swing_low" if long else "swing_high")
+        sl_note = (
+            ("đáy OB" if inval else "swing low") if long else ("đỉnh OB" if inval else "swing high")
+        )
+        if base and base > 0:
+            stop = base * (1 - buf / 100) if long else base * (1 + buf / 100)
+            risk = entry_worst - stop if long else stop - entry_worst
+            if risk > 0:
+                rr_risk = risk
+
+        merged, dropped, too_close = cls._smc_tp_ladder(
+            lv, entry_ref, entry_worst, rr_risk, direction
+        )
+        # Mốc đầu tiên ĐẠT chuẩn R:R, tính trên giá thật thay vì mốc min_rr tổng hợp.
+        hit = None
+        if rr_risk:
+            hit = next(
+                (
+                    i
+                    for i, (t, _) in enumerate(merged, 1)
+                    if abs(t - entry_worst) / rr_risk >= min_rr
+                ),
+                None,
+            )
+
+        # Thứ tự kiểm tra = thứ tự nghiêm trọng. Không SL đứng trước mọi thứ: kế hoạch không
+        # có điểm dừng lỗ thì không phải kế hoạch, dù thang TP có đẹp tới đâu.
+        reject = None
+        if rr_risk is None:
+            reject = "không dựng được SL từ cấu trúc (không có biên OB / swing hợp lệ)"
+        elif not merged:
+            reject = "không có mốc thanh khoản/cấu trúc nào phía trước để làm TP"
+        elif hit is None:
+            reject = (
+                f"mốc xa nhất chỉ đạt 1:{abs(merged[-1][0] - entry_worst) / rr_risk:.1f}, "
+                f"dưới ngưỡng 1:{min_rr:g}"
+            )
+
+        return {
+            **base_out,
+            "lo": lo,
+            "hi": hi,
+            "entry_note": entry_note,
+            "inval": inval,
+            "entry_ref": entry_ref,
+            "entry_worst": entry_worst,
+            "stop": stop,
+            "sl_note": sl_note,
+            "rr_risk": rr_risk,
+            "targets": merged,
+            "dropped": dropped,
+            "too_close": too_close,
+            "rr_first": (abs(merged[0][0] - entry_worst) / rr_risk)
+            if (merged and rr_risk)
+            else None,
+            "reject": reject,
+        }
+
+    @classmethod
+    def _smc_plan_block(
+        cls, strategy, tf: str, lv: dict, price: float, direction: str, live_price=None
+    ) -> list[str]:
+        """Khối 'Kịch bản chính' (mục 6): bảng Giá TT/Entry/SL/TP/R:R canh cột
+        (monospace) + trigger + điểm vô hiệu hóa + nhận xét sweep/gãy.
+
+        Mọi phép tính rủi ro lấy ở MÉP XẤU NHẤT của vùng entry (mua đắt nhất cho
+        LONG / bán rẻ nhất cho SHORT), nên tỉ lệ công bố vẫn đúng dù lệnh khớp ở
+        bất kỳ đâu trong vùng.
+
+        R:R công bố là số ĐO ĐƯỢC trên mốc cấu trúc thật, KHÔNG phải ngưỡng
+        `min_rr` mặc định — thang TP không còn mốc tổng hợp nào để bấu víu. Cấu
+        trúc không với tới `min_rr` → `_smc_plan_notes` đề nghị BỎ LỆNH.
+        """
+        long = direction == "long"
+        fmt = cls._smc_fmt_price
+
+        d = cls._smc_trade_decision(strategy, lv, price, direction)
+        min_rr = d["min_rr"]
+        lo, hi, entry_note = d["lo"], d["hi"], d["entry_note"]
+        entry_ref, entry_worst = d["entry_ref"], d["entry_worst"]
+        stop, rr_risk, sl_note = d["stop"], d["rr_risk"], d["sl_note"]
+        merged, dropped, too_close = d["targets"], d["dropped"], d["too_close"]
+
+        def pct(level: float) -> str:
+            # % so với ENTRY (khoảng cách SL/TP từ điểm vào) — đúng hướng lời/lỗ.
+            return f"{(level / entry_ref - 1) * 100:+.1f}%"
+
+        cur = live_price or price
+        rows = [
+            ("Giá TT", fmt(cur), cls._smc_price_vs_zone(cur, lo, hi)),
+            ("Entry", f"{fmt(lo)}-{fmt(hi)}", entry_note),
+        ]
+        if stop:
+            rows.append(("SL", fmt(stop), f"{pct(stop)} · {'dưới' if long else 'trên'} {sl_note}"))
+        else:
+            rows.append(("SL", "n/a", "chưa có mốc cấu trúc"))
+        for i, (t, name) in enumerate(merged, 1):
+            mult = f" · {abs(t - entry_worst) / rr_risk:.1f}R" if rr_risk else ""
+            rows.append((f"TP{i}", fmt(t), f"{pct(t)} · {name}{mult}"))
+        if not merged:
+            rows.append(("TP", "n/a", "chưa có mốc thanh khoản/cấu trúc nào phía trước"))
+
+        # R:R đo trên mốc THẬT gần nhất và xa nhất — không có số mặc định 1:2.
+        if rr_risk and merged:
+            rows.append(
+                (
+                    "R:R TP1",
+                    f"1 : {abs(merged[0][0] - entry_worst) / rr_risk:.1f}",
+                    f"tính ở mép {fmt(entry_worst)}",
+                )
+            )
+            rows.append(
+                (
+                    "R:R xa",
+                    f"1 : {abs(merged[-1][0] - entry_worst) / rr_risk:.1f}",
+                    f"nếu giữ tới TP{len(merged)}",
+                )
+            )
+
+        # Bảng canh cột trong block monospace.
+        w1 = max(len(r[0]) for r in rows)
+        w2 = max(len(r[1]) for r in rows)
+        table = [f"{a.ljust(w1)}  {b.rjust(w2)}  {c}".rstrip() for a, b, c in rows]
+
+        out = [f"🎯 *KỊCH BẢN CHÍNH: {'LONG' if long else 'SHORT'}* (`{tf}`)", "```", *table, "```"]
+        out += cls._smc_plan_notes(
+            long, fmt, lo, hi, stop, rr_risk, merged, entry_worst, min_rr, dropped, too_close
+        )
+        note = cls._smc_break_note(direction, price, live_price, stop, lv)
+        if note:
+            out.insert(1, note)
+        return out
+
+    @classmethod
+    def _smc_plan_notes(
+        cls, long, fmt, lo, hi, stop, rr_risk, merged, entry_worst, min_rr, dropped, too_close
+    ) -> list[str]:
+        """Các dòng ghi chú dưới bảng: cách đặt lệnh, trigger, kỷ luật chốt lời,
+        mốc bị bỏ vì quá xa, và phán quyết BỎ LỆNH khi cấu trúc không với tới
+        `min_rr`.
+
+        Mọi mốc trong `merged` đều có thanh khoản/cấu trúc đỡ nên không còn dòng
+        chú thích phân loại mốc mạnh/yếu — cái gì hiện trong bảng là mục tiêu
+        thật, cái gì không đủ tiêu chuẩn thì không được hiện.
+        """
+        out = [
+            f"• Đặt lệnh: limit trong vùng `{fmt(lo)}-{fmt(hi)}`, KHÔNG đuổi giá ngoài vùng.",
+            "• Trigger: chờ phản ứng giá / CHoCH khung 15m-1H tại vùng Entry.",
+        ]
+        # Mốc đầu tiên ĐẠT chuẩn R:R, tính trên giá thật thay vì mốc min_rr tổng hợp.
+        hit = None
+        if rr_risk:
+            hit = next(
+                (
+                    i
+                    for i, (t, _) in enumerate(merged, 1)
+                    if abs(t - entry_worst) / rr_risk >= min_rr
+                ),
+                None,
+            )
+        if hit:
+            out.append(
+                f"• Chốt lời: TP{hit} là mốc thật đầu tiên đạt 1:{min_rr:g} — giữ tối thiểu tới "
+                f"đó; các mốc trước nó chỉ chốt MỘT PHẦN."
+            )
+        # Cắt bớt phải NÓI RA: mốc bị bỏ vẫn là mốc thật, chỉ là quá xa để dùng.
+        if dropped:
+            near = dropped[0]
+            extra = f" (gần nhất: `{fmt(near[0])}` — {near[1]}"
+            extra += f", {abs(near[0] - entry_worst) / rr_risk:.1f}R)" if rr_risk else ")"
+            out.append(f"• Đã bỏ {len(dropped)} mốc quá xa để lập kế hoạch{extra}.")
+        # Mốc quá gần cũng phải nói ra, nếu không bảng trông như "chỉ có bấy nhiêu".
+        if too_close and rr_risk:
+            far = too_close[0]
+            out.append(
+                f"• Đã bỏ {len(too_close)} mốc quá gần, không tương xứng với SL "
+                f"(xa nhất trong nhóm: `{fmt(far[0])}` — {far[1]}, "
+                f"{abs(far[0] - entry_worst) / rr_risk:.1f}R)."
+            )
+        # Cấu trúc không với tới min_rr -> BỎ LỆNH. Rủi ro lớn + lời nhỏ là setup
+        # phải từ chối, không phải setup cần thêm mốc ngoại suy cho R:R đẹp.
+        #
+        # Nhánh "không có SL" phải đứng đầu và phải NÓI RA: trước đây bảng chỉ ghi "SL n/a"
+        # rồi im lặng, đọc như một kế hoạch bình thường thiếu một ô. Kế hoạch không có điểm
+        # dừng lỗ thì không phải kế hoạch — và `_smc_trade_decision` cũng từ chối ở đúng
+        # điều kiện này, nên báo cáo phải nói cùng một điều.
+        if not rr_risk:
+            out.append(
+                "❌ *BỎ LỆNH:* không dựng được SL từ cấu trúc (không có biên OB / swing hợp lệ) "
+                "— không có điểm dừng lỗ thì không có kế hoạch."
+            )
+        elif rr_risk and not merged:
+            out.append(
+                f"❌ *BỎ LỆNH:* không có mốc thanh khoản/cấu trúc nào phía trước để làm TP — "
+                f"không có cách nào biết lời tới đâu, trong khi SL đã mất `{fmt(rr_risk)}`."
+            )
+        elif rr_risk and hit is None:
+            far_r = abs(merged[-1][0] - entry_worst) / rr_risk
+            out.append(
+                f"❌ *BỎ LỆNH:* mốc cấu trúc xa nhất chỉ đạt `1 : {far_r:.1f}`, dưới ngưỡng "
+                f"1:{min_rr:g} — rủi ro lớn mà lợi nhuận nhỏ. Chỉ vào lệnh nếu siết được SL "
+                "sát biên OB hơn để tỉ lệ đạt chuẩn."
+            )
+        if stop:
+            out.append(
+                f"• Vô hiệu hóa: nến ĐÓNG qua `{fmt(stop)}` → cấu trúc "
+                f"{'tăng' if long else 'giảm'} gãy."
+            )
+        return out
+
+    @classmethod
+    def _smc_sec_bias(cls, htf, avail, sw, bull, bear, lv_by) -> list[str]:
+        """Mục 1 — Bức tranh đa khung (HTF bias)."""
+        word = cls._smc_trend_word
+        n = len(avail)
+        mtf = " ".join(f"{t}{'🟢' if sw[t] > 0 else '🔴' if sw[t] < 0 else '⚪'}" for t in avail)
+        if bull > bear:
+            concl = f"đồng thuận TĂNG ({bull}/{n}) → ưu tiên LONG thuận xu hướng"
+        elif bear > bull:
+            concl = f"đồng thuận GIẢM ({bear}/{n}) → ưu tiên SHORT thuận xu hướng"
+        else:
+            concl = "xung đột giữa các khung → đứng ngoài, chờ rõ"
+        out = [
+            "",
+            "*1️⃣ Bức tranh đa khung (HTF Bias)*",
+            f"• Chính ({htf}): {word(lv_by[htf].get('swing_trend'))}",
+        ]
+        if "4h" in avail:
+            out.append(
+                f"• Phụ (4H): swing {word(lv_by['4h'].get('swing_trend'))}, "
+                f"internal {word(lv_by['4h'].get('internal_trend'))}"
+            )
+        out.append(f"• MTF: {mtf} — {concl}")
+        return out
+
+    @classmethod
+    def _smc_sec_structure(cls, stf, lv) -> list[str]:
+        """Mục 2 — Cấu trúc & SMC (OB / FVG)."""
+        fmt = cls._smc_fmt_price
+        word = cls._smc_trend_word
+        out = [
+            "",
+            f"*2️⃣ Cấu trúc & SMC* (`{stf}`)",
+            f"• Cấu trúc: Internal {word(lv.get('internal_trend'))} · "
+            f"Swing {word(lv.get('swing_trend'))}",
+        ]
+        a, b = lv.get("bear_ob_bot"), lv.get("bear_ob_top")
+        if a and b:
+            out.append(f"• Vùng Cung (Bear OB): `{fmt(a)}-{fmt(b)}`")
+        c, d = lv.get("bull_ob_bot"), lv.get("bull_ob_top")
+        if c and d:
+            out.append(f"• Vùng Cầu (Bull OB): `{fmt(c)}-{fmt(d)}`")
+        e, f = lv.get("fvg_bot"), lv.get("fvg_top")
+        if e and f:
+            out.append(f"• FVG (imbalance): `{fmt(e)}-{fmt(f)}`")
+        return out
+
+    @classmethod
+    def _smc_sec_liquidity(cls, lv, live_price) -> list[str]:
+        """Mục 3 — Thanh khoản (BSL/SSL) & nhận định sweep."""
+        fmt = cls._smc_fmt_price
+        bsl, ssl = lv.get("swing_high"), lv.get("swing_low")
+        out = ["", "*3️⃣ Thanh khoản & Mức quan trọng*"]
+        if bsl:
+            out.append(f"• BSL (đỉnh cũ/EQH): `{fmt(bsl)}` — nơi phe Short đặt SL")
+        if ssl:
+            out.append(f"• SSL (đáy cũ/EQL): `{fmt(ssl)}` — nơi phe Long đặt SL")
+        if live_price and ssl and live_price < ssl:
+            note = f"giá đã quét SSL (đáy `{fmt(ssl)}`) → canh phản ứng tăng (sweep)."
+        elif live_price and bsl and live_price > bsl:
+            note = f"giá đã quét BSL (đỉnh `{fmt(bsl)}`) → canh phản ứng giảm (sweep)."
+        else:
+            note = "chưa quét đỉnh/đáy gần nhất; giá trong range."
+        out.append(f"• Sweep: {note}")
+        return out
+
+    @classmethod
+    def _smc_fib_line(cls, lv, direction) -> str | None:
+        """Golden pocket Fib 0.618-0.786 từ swing high/low, theo hướng vào lệnh.
+
+        LONG: thoái lui từ đỉnh (discount, mua). SHORT: từ đáy (premium, bán).
+        """
+        sh, sl = lv.get("swing_high"), lv.get("swing_low")
+        if not (sh and sl and sh > sl):
+            return None
+        fmt = cls._smc_fmt_price
+        rng = sh - sl
+        if direction == "short":
+            f618, f786, zone = sl + 0.618 * rng, sl + 0.786 * rng, "premium (bán)"
+        else:
+            f618, f786, zone = sh - 0.618 * rng, sh - 0.786 * rng, "discount (mua)"
+        lo, hi = sorted((f618, f786))
+        return f"• Fib golden pocket: `{fmt(lo)}-{fmt(hi)}` (0.618-0.786, {zone})"
+
+    @classmethod
+    def _smc_elliott_note(cls, lv, cp) -> list[str]:
+        """Ước lượng bối cảnh sóng Elliott (heuristic từ trend + vị trí giá).
+
+        KHÔNG phải đếm sóng chính xác — chỉ gợi ý phase, cần xác nhận thủ công.
+        """
+        sw = lv.get("swing_trend") or 0
+        it = lv.get("internal_trend") or 0
+        eq = lv.get("equilibrium")
+        in_disc = (cp < eq) if (cp and eq) else None
+        if sw > 0:  # xu hướng tăng
+            if it < 0 or in_disc:
+                guess = (
+                    "Hồi quy trong xu hướng TĂNG — khả năng đang ở sóng điều chỉnh "
+                    "(2 hoặc 4 / ABC), chờ kết thúc để vào sóng đẩy tăng tiếp."
+                )
+            else:
+                guess = "Đang trong sóng ĐẨY TĂNG (impulse 3/5) — thuận đà."
+        elif sw < 0:  # xu hướng giảm
+            if it > 0 or (in_disc is False):
+                guess = (
+                    "Hồi quy trong xu hướng GIẢM — khả năng sóng điều chỉnh, "
+                    "chờ kết thúc để vào sóng đẩy giảm tiếp."
+                )
+            else:
+                guess = "Đang trong sóng ĐẨY GIẢM (impulse) — thuận đà."
+        else:
+            guess = "Đi ngang — có thể sóng điều chỉnh phẳng/tam giác, chờ phá vỡ."
+        out = ["", "*4️⃣ Sóng Elliott* (ước lượng)"]
+        wave = cls._smc_wave_estimate(lv.get("pivots") or [], sw)
+        if wave:
+            out.append(f"• Vị trí: {wave}")
+        out.append(f"• Bối cảnh: {guess}")
+        out.append("• _Heuristic từ pivot/cấu trúc — cần xác nhận đếm sóng thủ công._")
+        return out
+
+    @classmethod
+    def _smc_sec_confluence(cls, stf, lv, cp, direction) -> list[str]:
+        """Mục 5 — Hợp lưu kỹ thuật (RSI / EMA / MACD / Fib)."""
+        out = ["", f"*5️⃣ Hợp lưu kỹ thuật* (`{stf}`)"]
+        rsi = lv.get("rsi")
+        if rsi is not None:
+            st = "quá bán <30" if rsi <= 30 else "quá mua >70" if rsi >= 70 else "trung tính"
+            out.append(f"• RSI: {rsi:.0f} — {st}")
+        e200, e50 = lv.get("ema200"), lv.get("ema50")
+        if cp and e200:
+            s = f"giá {'trên' if cp >= e200 else 'dưới'} EMA200"
+            if e50:
+                s += f", {'trên' if cp >= e50 else 'dưới'} EMA50"
+            out.append(f"• EMA: {s}")
+        macd, sig = lv.get("macd"), lv.get("macdsignal")
+        if macd is not None and sig is not None:
+            out.append(f"• MACD: {'cắt lên (> signal)' if macd >= sig else 'cắt xuống (< signal)'}")
+        fib = cls._smc_fib_line(lv, direction)
+        out.append(fib if fib else "• Fib: chưa đủ swing để tính.")
+        out.append("• Volume profile: chưa tính tự động.")
+        return out
+
+    @classmethod
+    def _smc_sec_plan(cls, strategy, stf, lv, price, direction, live_price) -> list[str]:
+        """Mục 6 — Kế hoạch giao dịch (kịch bản chính + phụ)."""
+        fmt = cls._smc_fmt_price
+        out = ["", "*6️⃣ Kế hoạch giao dịch*"]
+        if not direction or not price:
+            out.append(
+                "⚪ Đứng ngoài — các khung xung đột / thiếu dữ liệu, chưa có kịch bản xác suất cao."
+            )
+            return out
+        out += cls._smc_plan_block(strategy, stf, lv, price, direction, live_price)
+        if direction == "long" and lv.get("swing_low"):
+            out.append(
+                f"🔄 *Kịch bản phụ*: nếu nến ĐÓNG dưới SSL `{fmt(lv['swing_low'])}` → hủy LONG, "
+                "chờ retest để SHORT theo hướng phá vỡ."
+            )
+        elif direction == "short" and lv.get("swing_high"):
+            out.append(
+                f"🔄 *Kịch bản phụ*: nếu nến ĐÓNG trên BSL `{fmt(lv['swing_high'])}` → hủy SHORT, "
+                "chờ retest để LONG theo hướng phá vỡ."
+            )
+        return out
+
+    @classmethod
+    def _smc_sec_risk(cls, stf, lv, direction) -> list[str]:
+        """Mục 7 — Quản trị rủi ro & lưu ý."""
+        out = ["", "*7️⃣ Quản trị rủi ro*", "• Risk/lệnh: tối đa 1-2% tài khoản."]
+        it = lv.get("internal_trend") or 0
+        if direction and it != 0 and (it > 0) != (direction == "long"):
+            out.append(
+                f"• Ghi chú: internal `{stf}` đang {cls._smc_trend_word(it).lower()} ngược bias "
+                "→ đây là nhịp hồi; nếu vào lệnh ngược bias phải giảm nửa volume."
+            )
+        out.append(
+            "⚠️ _Phân tích kỹ thuật dựa trên cấu trúc/thanh khoản/xác suất — không phải lời "
+            "khuyên đầu tư (NFA). Tự chịu trách nhiệm và tuân thủ dừng lỗ._"
+        )
+        return out
+
+    @classmethod
+    def _smc_report_context(cls, strategy, tfs, levels_by_tf) -> tuple | None:
+        """Khung dựng kế hoạch + hướng vào lệnh — dùng chung cho báo cáo và lệnh tự động.
+
+        Tách ra vì `_auto_entry_from_analysis` phải quyết định trên ĐÚNG khung và ĐÚNG hướng
+        mà báo cáo vừa gửi đi. Tính lại ở hai nơi là mở đường cho bot vào lệnh theo một khung
+        khác với khung nó vừa báo.
+
+        :return: (avail, htf, stf, direction, sw, bull, bear) hoặc None khi không có khung nào
+        """
+        avail = [t for t in tfs if t in levels_by_tf]
+        if not avail:
+            return None
+        htf = next((t for t in ("1w", "1d") if t in avail), avail[-1])
+        stf = (
+            strategy.timeframe
+            if strategy.timeframe in avail
+            else ("4h" if "4h" in avail else avail[0])
+        )
+        sw = {t: (levels_by_tf[t].get("swing_trend") or 0) for t in avail}
+        bull = sum(1 for v in sw.values() if v > 0)
+        bear = sum(1 for v in sw.values() if v < 0)
+        direction = "long" if bull > bear else "short" if bear > bull else None
+        return avail, htf, stf, direction, sw, bull, bear
+
+    @classmethod
+    def _smc_signal_report(
+        cls, strategy, pair, tfs, levels_by_tf, price_by_tf, live_price, now_str
+    ) -> list[str]:
+        """Ghép báo cáo 7 mục theo template-signal.md từ levels đa khung."""
+        ctx = cls._smc_report_context(strategy, tfs, levels_by_tf)
+        if not ctx:
+            return [f"📊 *{pair}* — ⚠️ Không lấy được dữ liệu khung nào."]
+        avail, htf, stf, direction, sw, bull, bear = ctx
+        fmt = cls._smc_fmt_price
+        lv = levels_by_tf[stf]
+        cp = price_by_tf.get(stf) or (live_price or 0.0)
+        pos = "LONG" if bull > bear else "SHORT" if bear > bull else "ĐỨNG NGOÀI"
+        # Nhãn theo khung DỰNG KẾ HOẠCH, không theo khung bias: kế hoạch trên 5m là scalping
+        # kể cả khi bias lấy từ 4h.
+        if stf in ("4h", "1d", "1w"):
+            setup = "Swing Trade"
+        elif stf in ("1m", "3m", "5m"):
+            setup = "Scalping"
+        else:
+            setup = "Day Trade"
+        shown = live_price if live_price is not None else price_by_tf.get(stf)
+        tag = "live" if live_price is not None else "nến đóng"
+
+        out = [f"📊 *Phân Tích & Kế Hoạch: {pair}*"]
+        if shown is not None:
+            out.append(f"Giá: `{fmt(shown)}` ({tag}) | Cập nhật: `{now_str}`")
+        out.append(f"Vị thế ưu tiên: *{pos}* | Loại: {setup}")
+        out += cls._smc_sec_bias(htf, avail, sw, bull, bear, levels_by_tf)
+        out += cls._smc_sec_structure(stf, lv)
+        out += cls._smc_sec_liquidity(lv, live_price)
+        out += cls._smc_elliott_note(lv, cp)
+        out += cls._smc_sec_confluence(stf, lv, cp, direction)
+        out += cls._smc_sec_plan(strategy, stf, lv, price_by_tf.get(stf, cp), direction, live_price)
+        out += cls._smc_sec_risk(stf, lv, direction)
+        return out
+
+    @authorized_only
+    async def _analysis(self, update: Update, context: CallbackContext) -> None:
+        """
+        Handler for /analysis [pair] [tf ...]
+        Phân tích SMC ĐA KHUNG THỜI GIAN một cặp theo SmcElliottStrategy.
+        - Giá hiển thị: ticker khớp mới nhất (công khai, không cần API key).
+        - Mỗi khung: fetch OHLCV mới tại thời điểm gọi, bỏ nến đang hình thành,
+          phân tích trên nến ĐÃ ĐÓNG gần nhất (tránh repaint & dataframe cũ).
+        Ví dụ:  /analysis            -> BTC, khung mặc định 15m 1h 4h 1d
+                /analysis ETH 4h 1d  -> ETH, chỉ 4h và 1d
+        """
+        ft = self._rpc._freqtrade
+        pair, tfs = self._smc_parse_args(
+            context.args or [], ft.active_pair_whitelist, ft.config["stake_currency"]
+        )
+        report = await self._build_analysis_report(ft, pair, tfs)
+        await self._send_msg(report)
+
+    @staticmethod
+    def _smc_quick_pairs(whitelist: list[str], stake: str) -> list[str]:
+        """4 cặp cố định của `/smc` (BTC, ETH, XAU, SOL), đúng format bot đang chạy.
+
+        Cặp có trong whitelist thì lấy nguyên chuỗi — whitelist đã đúng
+        `BASE/QUOTE:SETTLE` khi chạy futures. Cặp thiếu thì dựng theo hậu tố của
+        cặp đầu whitelist; hardcode format spot ở đây sẽ sai khi bot chạy futures.
+        """
+        by_base = {p.split("/")[0].upper(): p for p in whitelist or []}
+        sample = whitelist[0] if whitelist else ""
+        suffix = sample.split("/", 1)[1] if "/" in sample else stake
+        return [by_base.get(base, f"{base}/{suffix}") for base in SMC_QUICK_BASES]
+
+    @staticmethod
+    def _smc_quick_timeframes(ft) -> list[str]:
+        """Khung mặc định của `/smc` — bám theo khung giao dịch của chính bot đang chạy.
+
+        Trước đây cứng là `SMC_QUICK_TIMEFRAME` (4h), nên bot scalping 5m (`./run_smc_5.sh`)
+        bấm /smc lại nhận kế hoạch swing 4h: một báo cáo không liên quan gì tới lệnh mà bot
+        đó thực sự vào, và không có dấu hiệu nào cho thấy nó sai khung.
+
+        Bot khung ngắn (< 1h) trả về cả bộ `SMC_SCALP_TIMEFRAMES` chứ không riêng khung của nó:
+        `_smc_signal_report` lấy `avail[0]` dựng kế hoạch Entry/SL/TP và `avail[-1]` lấy bias,
+        nên danh sách một phần tử sẽ lấy bias ngay trên khung vào lệnh — đúng thứ mà bias đa
+        khung sinh ra để tránh.
+
+        :param ft: FreqtradeBot đang chạy
+        :return: danh sách khung, thứ tự thấp -> cao
+        """
+        from freqtrade.exchange import timeframe_to_minutes
+
+        tf = getattr(ft.strategy, "timeframe", None) or ft.config.get("timeframe")
+        # isinstance chứ không phải truthy: /help cũng gọi hàm này, và ở đó `ft` có thể là
+        # mock (test) — `getattr` trên mock trả về mock, đưa thẳng vào timeframe_to_minutes
+        # sẽ ném lỗi và giết luôn lệnh /help.
+        if not isinstance(tf, str):
+            return [SMC_QUICK_TIMEFRAME]
+        return list(SMC_SCALP_TIMEFRAMES) if timeframe_to_minutes(tf) < 60 else [tf]
+
+    async def _send_pair_reports(self, ft, pairs: list[str], tfs: list[str], header: str) -> None:
+        """Gửi header rồi mỗi cặp một báo cáo.
+
+        Lỗi một cặp (sàn không niêm yết, fetch hụt) không được chặn các cặp còn lại — và
+        phải báo ra Telegram, im lặng ở đây đọc y như "cặp đó không có tín hiệu".
+        """
+        await self._send_msg(header)
+        for pair in pairs:
+            try:
+                await self._send_msg(await self._build_analysis_report(ft, pair, tfs))
+            except Exception as e:
+                logger.warning("Báo cáo %s lỗi: %s: %s", pair, type(e).__name__, e)
+                await self._send_msg(f"⚠️ `{pair}`: không dựng được báo cáo ({type(e).__name__}).")
+
+    @authorized_only
+    async def _smc(self, update: Update, context: CallbackContext) -> None:
+        """
+        Handler for /smc [pair] [tf ...]
+        Không tham số -> báo cáo 4 cặp cố định (BTC, ETH, XAU, SOL) trên khung của chính bot
+        đang chạy (`_smc_quick_timeframes`), mỗi cặp một tin nhắn.
+        Có tham số -> hành xử y hệt /analysis.
+        Ví dụ:  /smc            -> bot 4h: BTC, ETH, XAU, SOL trên 4h
+                                   bot 5m: cùng 4 cặp trên 5m + 15m (giống /scalp)
+                /smc ETH 4h 1d  -> ETH, chỉ 4h và 1d
+        """
+        if context.args:
+            await self._analysis(update, context)
+            return
+        ft = self._rpc._freqtrade
+        pairs = self._smc_quick_pairs(ft.active_pair_whitelist, ft.config["stake_currency"])
+        tfs = self._smc_quick_timeframes(ft)
+        await self._send_pair_reports(
+            ft,
+            pairs,
+            tfs,
+            f"⚡ *Phân tích nhanh {' + '.join(tfs)}* — {len(pairs)} cặp",
+        )
+
+    @authorized_only
+    async def _scalp(self, update: Update, context: CallbackContext) -> None:
+        """
+        Handler for /scalp [pair] [tf ...]
+        Bản khung ngắn của /smc: cùng 4 cặp nhưng chạy 5m + 15m để tìm lệnh trong ngày.
+        Bias lấy từ 15m, kế hoạch Entry/SL/TP dựng trên 5m (xem SMC_SCALP_TIMEFRAMES).
+        Ví dụ:  /scalp             -> BTC, ETH, XAU, SOL trên 5m + 15m
+                /scalp SOL 5m 15m 1h -> SOL, thêm 1h làm khung bias
+        """
+        ft = self._rpc._freqtrade
+        tfs = list(SMC_SCALP_TIMEFRAMES)
+        if context.args:
+            pair, tfs = self._smc_parse_args(
+                context.args, ft.active_pair_whitelist, ft.config["stake_currency"], tfs
+            )
+            pairs = [pair]
+        else:
+            pairs = self._smc_quick_pairs(ft.active_pair_whitelist, ft.config["stake_currency"])
+        await self._send_pair_reports(
+            ft, pairs, tfs, f"⏱ *Scalping {'+'.join(tfs)}* — {len(pairs)} cặp"
+        )
+
+    async def _build_analysis_report(self, ft, pair: str, tfs: list[str]) -> str:
+        """Dựng báo cáo /analysis (7 mục) cho 1 cặp — dùng chung cho lệnh & lịch."""
+        text, _decision = await self._build_analysis(ft, pair, tfs)
+        return text
+
+    async def _build_analysis(self, ft, pair: str, tfs: list[str]) -> tuple[str, dict | None]:
+        """Như `_build_analysis_report` nhưng trả kèm quyết định giao dịch có cấu trúc.
+
+        Lịch /analysis dùng bản này để vào lệnh theo ĐÚNG kế hoạch vừa gửi đi
+        (`_auto_entry_from_analysis`). Các lệnh gõ tay vẫn đi qua `_build_analysis_report`
+        và không bao giờ tự vào lệnh — gõ /analysis để XEM thì không được biến thành lệnh thật.
+
+        :return: (text báo cáo, decision) — decision là None khi không dựng được kế hoạch
+        """
+        from freqtrade.enums import CandleType
+        from freqtrade.util import dt_now
+
+        candle_type = ft.config.get("candle_type_def", CandleType.SPOT)
+        # Giá khớp mới nhất (ticker công khai) — dùng cho hiển thị & nhận định sweep.
+        live_price = await asyncio.to_thread(self._smc_live_price, ft, pair)
+
+        levels_by_tf: dict[str, dict] = {}
+        price_by_tf: dict[str, float] = {}
+        for tf in tfs:
+            # Fetch + phân tích trên nến đã đóng (chạy trong thread riêng vì blocking).
+            _line, _score, price, levels = await asyncio.to_thread(
+                self._smc_tf_line, ft, pair, tf, candle_type
+            )
+            if price is not None:
+                price_by_tf[tf] = price
+            if levels:
+                levels_by_tf[tf] = levels
+
+        now_str = dt_now().strftime("%Y-%m-%d %H:%M UTC")
+        text = "\n".join(
+            self._smc_signal_report(
+                ft.strategy, pair, tfs, levels_by_tf, price_by_tf, live_price, now_str
+            )
+        )
+
+        decision = None
+        ctx = self._smc_report_context(ft.strategy, tfs, levels_by_tf)
+        if ctx:
+            _avail, _htf, stf, direction, *_ = ctx
+            cp = price_by_tf.get(stf) or (live_price or 0.0)
+            decision = self._smc_trade_decision(
+                ft.strategy, levels_by_tf[stf], price_by_tf.get(stf, cp), direction
+            )
+            decision["timeframe"] = stf
+            decision["live_price"] = live_price
+        return text, decision
+
+    @staticmethod
+    def _next_analysis_slot(
+        now: datetime,
+        interval_hours: int,
+        day_start_hour: int,
+        interval_minutes: int | None = None,
+    ) -> datetime:
+        """Thời điểm chạy /analysis kế tiếp: các mốc cách đều nhau, neo tại `day_start_hour`.
+
+        `interval_minutes` (nếu có) THẮNG `interval_hours`, để bot scalping chạy dưới mức một
+        giờ — bot 5m đợi 60 phút một lần thì kèo đã đi mất trước lượt phân tích kế tiếp.
+
+        Tính bằng phút kể từ mốc neo thay vì dựng sẵn danh sách giờ trong ngày. Cách cũ
+        (`range(24 // interval)`) chỉ đúng khi chu kỳ chia hết cho 24: với 5h nó sinh
+        7,12,17,22 rồi nhảy về 7 hôm sau — khoảng trống 9 tiếng giữa hai lượt liền kề. Cách
+        này giữ khoảng cách đều tuyệt đối, đổi lại chuỗi mốc có thể trôi qua ngày khi chu kỳ
+        không chia hết cho 24h; với 15m/1h/4h thì hai cách cho kết quả y hệt.
+
+        :param now: thời điểm hiện tại (có timezone)
+        :param interval_hours: chu kỳ theo giờ, dùng khi không có `interval_minutes`
+        :param day_start_hour: giờ neo trong ngày
+        :param interval_minutes: chu kỳ theo phút, ưu tiên hơn `interval_hours`
+        :return: mốc kế tiếp, luôn LỚN HƠN `now` (đứng đúng mốc thì trả mốc sau, không lặp lại)
+        """
+        step = int(interval_minutes) if interval_minutes else int(interval_hours) * 60
+        step = max(1, step)
+        anchor = now.replace(hour=int(day_start_hour) % 24, minute=0, second=0, microsecond=0)
+        if anchor > now:
+            anchor -= timedelta(days=1)
+        elapsed = (now - anchor).total_seconds() / 60
+        return anchor + timedelta(minutes=(int(elapsed // step) + 1) * step)
+
+    def _auto_entry_from_analysis(self, ft, pair: str, decision: dict) -> str | None:
+        """Vào lệnh thật theo kế hoạch mà lịch /analysis vừa gửi. Chạy trong thread riêng.
+
+        Đây là đường vào lệnh THỨ HAI của bot, song song với `populate_entry_trend`. Nó CỐ Ý
+        bỏ qua các cổng của strategy (G1 bull_1d, G2 discount, score) — đó là điều được yêu
+        cầu, và cũng là rủi ro chính: các cổng đó nằm trong phần edge đã đo được trên 197 cặp,
+        còn luật này thì chưa từng được backtest.
+
+        Cái KHÔNG bỏ qua, vì `_rpc_force_entry` tự kiểm:
+          · `max_open_trades` của bot (rpc.py: "Maximum number of trades is reached")
+          · `stake_amount` + `available_capital` (qua `wallets.get_trade_stake_amount`)
+          · cặp đã có lệnh mở, bot không ở trạng thái RUNNING, cặp không hợp lệ
+
+        :return: dòng kết quả để gửi về Telegram, hoặc None khi không làm gì
+        """
+        from freqtrade.enums import SignalDirection
+        from freqtrade.rpc import RPCException
+
+        fmt = self._smc_fmt_price
+        if decision.get("reject"):
+            return None
+        # Long-only: SmcElliottStrategy đặt can_short=False và không có nhánh short nào.
+        # Vào short ở đây sẽ tạo vị thế mà mọi callback thoát lệnh của strategy đều không
+        # hiểu — tệ hơn nhiều so với bỏ lỡ.
+        if decision.get("direction") != "long":
+            return None
+
+        # Limit đặt tại MÉP XẤU NHẤT của vùng — đúng con số mà R:R trong báo cáo được tính
+        # trên đó. Đặt ở mép đẹp hơn thì R:R thực tế sẽ khác với R:R vừa công bố.
+        price: float | None = decision.get("entry_worst") or None
+        stop: float | None = decision.get("stop")
+        # Không rơi về giá thị trường khi thiếu entry/SL: lệnh vào ở giá khác kế hoạch là
+        # một lệnh KHÁC với lệnh vừa báo cáo, không phải cùng lệnh đặt hơi lệch.
+        if price is None or stop is None:
+            return f"⚠️ `{pair}`: kế hoạch thiếu giá entry hoặc SL → bỏ qua."
+        try:
+            trade = self._rpc._rpc_force_entry(
+                pair,
+                price,
+                order_type="limit",
+                order_side=SignalDirection.LONG,
+                enter_tag="analysis_auto",
+            )
+        except RPCException as e:
+            # Hết slot / đã có lệnh / bot đang stop: đây là hoạt động BÌNH THƯỜNG của hạn
+            # mức, không phải lỗi — nhưng vẫn phải nói ra, im lặng thì không ai biết vì sao
+            # báo cáo có kế hoạch mà tài khoản không có lệnh.
+            return f"⛔ `{pair}`: không vào được — {e}"
+        if trade is None:
+            return f"⚠️ `{pair}`: lệnh không được tạo (xem log)."
+        rr = decision.get("rr_first")
+        return (
+            f"✅ `{pair}`: đã đặt LONG limit `{fmt(price)}` "
+            f"(SL `{fmt(stop)}`"
+            + (f", R:R TP1 1:{rr:.1f}" if rr else "")
+            + f", khung `{decision.get('timeframe')}`)"
+        )
+
+    async def _run_scheduled_analysis(self, cfg: dict) -> None:
+        """Gửi báo cáo /analysis cho các cặp đã cấu hình (hoặc whitelist).
+
+        Bật `auto_entry.enabled` thì mỗi kế hoạch KHÔNG bị "BỎ LỆNH" sẽ được vào lệnh thật
+        ngay sau khi báo cáo của cặp đó gửi đi. Xem `_auto_entry_from_analysis`.
+        """
+        ft = self._rpc._freqtrade
+        tfs = cfg.get("timeframes") or ["15m", "1h", "4h", "1d"]
+        pairs = cfg.get("pairs") or (ft.active_pair_whitelist or [])[: int(cfg.get("max_pairs", 3))]
+        if not pairs:
+            return
+        auto = cfg.get("auto_entry") or {}
+        auto_on = bool(auto.get("enabled"))
+        # Trần riêng cho mỗi lượt chạy, KHÁC max_open_trades: nó chặn việc một lượt phân tích
+        # xấu quét sạch mọi slot cùng lúc. max_open_trades vẫn là trần tuyệt đối phía dưới.
+        left = int(auto.get("max_per_run", 2)) if auto_on else 0
+        if auto_on and not ft.config.get("force_entry_enable", False):
+            # Không tự bật hộ: force_entry_enable cũng mở /forcebuy cho bất kỳ ai vào được
+            # chat, nên đó phải là quyết định tường minh trong config.
+            await self._send_msg(
+                "⚠️ `auto_entry.enabled` đang bật nhưng `force_entry_enable` là false → "
+                'KHÔNG vào lệnh nào. Đặt `"force_entry_enable": true` trong config.'
+            )
+            auto_on = False
+
+        await self._send_msg("🕗 *Báo cáo phân tích định kỳ*")
+        results: list[str] = []
+        for pair in pairs:
+            try:
+                text, decision = await self._build_analysis(ft, pair, tfs)
+                await self._send_msg(text)
+            except Exception as e:
+                logger.warning("Lịch /analysis %s lỗi: %s: %s", pair, type(e).__name__, e)
+                continue
+            if not auto_on or not decision or left <= 0:
+                continue
+            try:
+                line = await asyncio.to_thread(self._auto_entry_from_analysis, ft, pair, decision)
+            except Exception as e:
+                logger.exception("Auto-entry %s lỗi: %s: %s", pair, type(e).__name__, e)
+                line = f"⚠️ `{pair}`: auto-entry lỗi ({type(e).__name__})."
+            if line:
+                results.append(line)
+                if line.startswith("✅"):
+                    left -= 1
+        if results:
+            await self._send_msg("🤖 *Vào lệnh tự động theo lịch*\n" + "\n".join(results))
+
+    async def _analysis_schedule_loop(self) -> None:
+        """Vòng lặp lịch: tự động chạy /analysis theo giờ cố định (nếu bật config).
+
+        Cấu hình dưới `telegram.analysis_schedule`:
+          enabled(bool), interval_hours(=4), day_start_hour(=7),
+          timezone(='Asia/Ho_Chi_Minh'), pairs(=whitelist), timeframes, max_pairs(=3).
+        """
+        cfg = (self._config.get("telegram") or {}).get("analysis_schedule") or {}
+        if not cfg.get("enabled"):
+            return
+        from zoneinfo import ZoneInfo
+
+        try:
+            tz = ZoneInfo(cfg.get("timezone", "Asia/Ho_Chi_Minh"))
+        except Exception:
+            tz = ZoneInfo("UTC")
+        interval = int(cfg.get("interval_hours", 4))
+        # Chu kỳ dưới một giờ cho bot scalping. Thắng interval_hours khi có mặt.
+        interval_min = cfg.get("interval_minutes")
+        interval_min = int(interval_min) if interval_min else None
+        day_start = int(cfg.get("day_start_hour", 7))
+        # Trễ sau khi nến đóng để chắc chắn sàn đã chốt nến (tránh fetch hụt).
+        offset = max(0, int(cfg.get("offset_seconds", 0)))
+        logger.info(
+            "Lịch /analysis bật: mỗi %s, neo %02d:00 (%s), trễ %ds.",
+            f"{interval_min}m" if interval_min else f"{interval}h",
+            day_start,
+            tz,
+            offset,
+        )
+        while not self._shutdown_event.is_set():
+            now = datetime.now(tz)
+            nxt = self._next_analysis_slot(now, interval, day_start, interval_min)
+            wait = max(1.0, (nxt - now).total_seconds() + offset)
+            try:
+                await asyncio.wait_for(self._shutdown_event.wait(), timeout=wait)
+                break  # nhận tín hiệu dừng
+            except TimeoutError:
+                pass
+            try:
+                await self._run_scheduled_analysis(cfg)
+            except Exception as e:
+                logger.warning("Lịch /analysis lỗi: %s: %s", type(e).__name__, e)
 
     @authorized_only
     async def _weekly(self, update: Update, context: CallbackContext) -> None:
@@ -1615,39 +3002,6 @@ class Telegram(RPCHandler):
         await self._send_msg("Open order canceled.")
 
     @authorized_only
-    async def _performance(self, update: Update, context: CallbackContext) -> None:
-        """
-        Handler for /performance.
-        Shows a performance statistic from finished trades
-        :param bot: telegram bot
-        :param update: message update
-        :return: None
-        """
-        trades = self._rpc._rpc_performance()
-        output = "<b>Performance:</b>\n"
-        for i, trade in enumerate(trades):
-            stat_line = (
-                f"{i + 1}.\t <code>{trade['pair']}\t"
-                f"{fmt_coin(trade['profit_abs'], self._config['stake_currency'])} "
-                f"({format_pct(trade['profit_ratio'])}) "
-                f"({trade['count']})</code>\n"
-            )
-
-            if len(output + stat_line) >= MAX_MESSAGE_LENGTH:
-                await self._send_msg(output, parse_mode=ParseMode.HTML)
-                output = stat_line
-            else:
-                output += stat_line
-
-        await self._send_msg(
-            output,
-            parse_mode=ParseMode.HTML,
-            reload_able=True,
-            callback_path="update_performance",
-            query=update.callback_query,
-        )
-
-    @authorized_only
     async def _enter_tag_performance(self, update: Update, context: CallbackContext) -> None:
         """
         Handler for /entries PAIR .
@@ -1755,31 +3109,6 @@ class Telegram(RPCHandler):
             parse_mode=ParseMode.MARKDOWN,
             reload_able=True,
             callback_path="update_mix_tag_performance",
-            query=update.callback_query,
-        )
-
-    @authorized_only
-    async def _count(self, update: Update, context: CallbackContext) -> None:
-        """
-        Handler for /count.
-        Returns the number of trades running
-        :param bot: telegram bot
-        :param update: message update
-        :return: None
-        """
-        counts = self._rpc._rpc_count()
-        message = tabulate(
-            {k: [v] for k, v in counts.items()},
-            headers=["current", "max", "total stake"],
-            tablefmt="simple",
-        )
-        message = f"<pre>{message}</pre>"
-        logger.debug(message)
-        await self._send_msg(
-            message,
-            parse_mode=ParseMode.HTML,
-            reload_able=True,
-            callback_path="update_count",
             query=update.callback_query,
         )
 
@@ -1955,7 +3284,6 @@ class Telegram(RPCHandler):
             "*/balance:* `Show bot managed balance per currency`\n"
             "*/balance full:* `Show account balance per currency`\n"
             "*/logs [limit]:* `Show latest logs - defaults to 10` \n"
-            "*/count:* `Show number of active trades compared to allowed number of trades`\n"
             "*/health* `Show latest process timestamp - defaults to 1970-01-01 00:00:00` \n"
             "*/marketdir [long | short | even | none]:* `Updates the user managed variable "
             "that represents the current market direction. If no direction is provided `"
@@ -1980,8 +3308,18 @@ class Telegram(RPCHandler):
             "over the last n days`\n"
             "*/profit_short [<n>]:* `Lists cumulative profit from all finished short trades, "
             "over the last n days`\n"
-            "*/performance:* `Show performance of each finished trade grouped by pair`\n"
             "*/daily <n>:* `Shows profit or loss per day, over the last n days`\n"
+            "*/analysis [pair] [tf...]:* `Báo cáo tín hiệu SMC đầy đủ cho MỘT cặp "
+            "(bias đa khung, cấu trúc/OB/FVG, thanh khoản, hợp lưu, kế hoạch "
+            "Entry/SL/TP, quản trị rủi ro) (mặc định 15m 1h 4h 1d)`\n"
+            "*/smc [pair] [tf...]:* `Không tham số: báo cáo khung "
+            f"{' + '.join(self._smc_quick_timeframes(self._rpc._freqtrade))} "
+            f"(theo khung của bot này) cho {', '.join(SMC_QUICK_BASES)}. "
+            "Có tham số: giống /analysis`\n"
+            "*/scalp [pair] [tf...]:* `Lệnh trong ngày — "
+            f"{' + '.join(SMC_SCALP_TIMEFRAMES)} (bias {SMC_SCALP_TIMEFRAMES[-1]}, "
+            f"kế hoạch {SMC_SCALP_TIMEFRAMES[0]}). Không tham số: "
+            f"{', '.join(SMC_QUICK_BASES)}`\n"
             "*/weekly <n>:* `Shows statistics per week, over the last n weeks`\n"
             "*/monthly <n>:* `Shows statistics per month, over the last n months`\n"
             "*/stats:* `Shows Wins / losses by Sell reason as well as "

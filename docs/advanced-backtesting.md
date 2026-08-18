@@ -21,6 +21,7 @@ This will tell freqtrade to output a pickled dictionary of strategy, pairs and c
 DataFrame of the candles that resulted in entry and exit signals.
 Depending on how many entries your strategy makes, this file may get quite large, so periodically check your `user_data/backtest_results` folder to delete old exports.
 
+
 Before running your next backtest, make sure you either delete your old backtest results or run
 backtesting with the `--cache none` option to make sure no cached results are used.
 

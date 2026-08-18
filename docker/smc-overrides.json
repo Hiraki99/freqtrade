@@ -1,0 +1,12 @@
+{
+    "$schema": "https://schema.freqtrade.io/schema.json",
+    "_comment_naming": "Named smc-overrides.json rather than config-docker.json because .gitignore line 2 is 'config*.json' — any config* name would be silently untracked.",
+    "_comment_db_url": "config-4h.json uses a relative sqlite path, which resolves to the container WORKDIR /freqtrade — not a volume — so trades would be lost on every `docker compose down`. Four slashes after sqlite: make the path absolute. The file name must mirror config-4h.json (tradesv3.4h-futures.sqlite): the bot has traded futures since 2026-08-05, and the old spot-era name tradesv3.4h.sqlite made it look like a spot database. Renamed 2026-08-07 while the file did not yet exist on any host — renaming it later would strand the trades inside the old file.",
+    "db_url": "sqlite:////freqtrade/user_data/tradesv3.4h-futures.sqlite",
+    "_comment_api_server": "config-4h.json binds 127.0.0.1, which inside a container means container-loopback only and makes the published port unreachable. 0.0.0.0 is safe here because docker-compose.smc.yml publishes to 127.0.0.1 on the host. Deep-merge keeps username/password/jwt_secret_key from config.json.",
+    "api_server": {
+        "enabled": true,
+        "listen_ip_address": "0.0.0.0",
+        "listen_port": 8091
+    }
+}

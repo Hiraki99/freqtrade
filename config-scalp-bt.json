@@ -1,0 +1,57 @@
+{
+    "$schema": "https://schema.freqtrade.io/schema.json",
+    "bot_name": "scalp-combo-bt",
+    "_comment": "Config CHỈ để backtest 3 combo của docs/SRS-BTC-Scalping-Combos.md. Đứng độc lập (không merge config.json) để không kéo theo telegram/api_server. KHÔNG đặt minimal_roi/stoploss ở đây: hai khoá đó trong config THẮNG thuộc tính strategy, mà toàn bộ luật thoát của các combo nằm ở custom_exit/custom_stoploss.",
+    "max_open_trades": 1,
+    "_comment_g01": "G-01 — tối đa 1 vị thế mở tại một thời điểm.",
+    "stake_currency": "USDT",
+    "stake_amount": "unlimited",
+    "_comment_stake": "Kích thước thật do custom_stake_amount quyết định theo RM-02 (equity * risk_pct / s). 'unlimited' chỉ để trần max_stake = trọn ví, không phải để vào full ví.",
+    "dry_run": true,
+    "dry_run_wallet": 10000,
+    "tradable_balance_ratio": 0.99,
+    "fiat_display_currency": "USD",
+    "trading_mode": "futures",
+    "margin_mode": "isolated",
+    "timeframe": "5m",
+    "fee": 0.00045,
+    "_comment_fee": "BT-03. freqtrade dùng MỘT mức phí cho cả hai chiều, nên 0.045%/chiều = 0.09% khứ hồi = maker entry 0.02% + taker exit 0.05% + slippage 0.02% (kịch bản RM-04b, áp cho Combo A và B). Combo C vào bằng market nên khứ hồi thật của nó là ~0.12% — chạy thêm bản fee 0.0006 để đo, xem báo cáo.",
+    "unfilledtimeout": {
+        "entry": 1440,
+        "exit": 10,
+        "exit_timeout_count": 0,
+        "unit": "minutes"
+    },
+    "_comment_unfilledtimeout": "Cố ý đặt RỘNG. ft_check_timed_out() kiểm khoá này TRƯỚC callback, nên để mặc định 10 phút thì luật hiệu lực-N-nến của từng combo (RM-04b, 3 nến cho A / 4 nến cho B) không bao giờ được chạy.",
+    "entry_pricing": {
+        "price_side": "same",
+        "use_order_book": true,
+        "order_book_top": 1,
+        "price_last_balance": 0.0
+    },
+    "exit_pricing": {
+        "price_side": "same",
+        "use_order_book": true,
+        "order_book_top": 1
+    },
+    "exchange": {
+        "name": "binance",
+        "key": "",
+        "secret": "",
+        "ccxt_config": {},
+        "ccxt_async_config": {},
+        "pair_whitelist": [
+            "BTC/USDT:USDT"
+        ],
+        "pair_blacklist": []
+    },
+    "pairlists": [
+        {
+            "method": "StaticPairList"
+        }
+    ],
+    "dataformat_ohlcv": "feather",
+    "internals": {
+        "process_throttle_secs": 5
+    }
+}

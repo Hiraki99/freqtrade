@@ -1,0 +1,116 @@
+{
+    "$schema": "https://schema.freqtrade.io/schema.json",
+    "max_open_trades": 4,
+    "stake_currency": "USDT",
+    "stake_amount": 100,
+    "tradable_balance_ratio": 0.99,
+    "fiat_display_currency": "USD",
+    "dry_run": true,
+    "dry_run_wallet": 1000,
+    "cancel_open_orders_on_exit": false,
+    "_comment_futures": "TOÀN BỘ bot SMC chạy futures (2026-08-07). Lý do: XAU và HYPE không tồn tại trên Binance spot (spot chỉ có XAUT/USDT của Tether và PAXG) — đã kiểm bằng `freqtrade list-pairs --exchange binance --trading-mode futures`. Trước đây chỉ config-4h.json đè sang futures, còn bot 5m kế thừa spot ở đây nên /scalp luôn lỗi ở XAU. margin_mode=isolated: rủi ro khoanh theo từng vị thế, một lệnh cháy không kéo cả ví. SmcElliottStrategy vẫn LONG-ONLY (can_short=False) và không định nghĩa leverage() nên đòn bẩy = 1.0 — futures ở đây chỉ để TIẾP CẬN CẶP, không phải để dùng đòn bẩy.",
+    "trading_mode": "futures",
+    "margin_mode": "isolated",
+    "timeframe": "5m",
+    "unfilledtimeout": {
+        "entry": 10,
+        "exit": 10,
+        "exit_timeout_count": 0,
+        "unit": "minutes"
+    },
+    "entry_pricing": {
+        "price_side": "same",
+        "use_order_book": true,
+        "order_book_top": 1,
+        "price_last_balance": 0.0,
+        "check_depth_of_market": {
+            "enabled": false,
+            "bids_to_ask_delta": 1
+        }
+    },
+    "exit_pricing": {
+        "price_side": "same",
+        "use_order_book": true,
+        "order_book_top": 1
+    },
+    "exchange": {
+        "name": "binance",
+        "key": "",
+        "secret": "",
+        "ccxt_config": {},
+        "ccxt_async_config": {},
+        "_comment_whitelist": "Format futures BASE/QUOTE:SETTLE — bắt buộc khi trading_mode=futures, dạng spot 'BTC/USDT' sẽ bị loại khỏi whitelist lúc khởi động. XAU thêm vào để /smc và /scalp có đủ 4 cặp (telegram.py SMC_QUICK_BASES).",
+        "pair_whitelist": [
+            "BTC/USDT:USDT",
+            "ETH/USDT:USDT",
+            "SOL/USDT:USDT",
+            "SUI/USDT:USDT",
+            "XAU/USDT:USDT"
+        ],
+        "_comment_blacklist": "Regex khớp cả dạng futures: 'BNB/.*' vẫn bắt 'BNB/USDT:USDT'. config-4h.json cố ý ghi đè khoá này thành [] để giao dịch BNB.",
+        "pair_blacklist": [
+            "BNB/.*"
+        ]
+    },
+    "pairlists": [
+        {
+            "method": "StaticPairList"
+        }
+    ],
+    "telegram": {
+        "enabled": true,
+        "token": "",
+        "chat_id": "",
+        "notification_settings": {
+            "status": "on",
+            "warning": "on",
+            "startup": "on",
+            "entry": "on",
+            "entry_fill": "on",
+            "exit": {
+                "roi": "on",
+                "emergency_exit": "on",
+                "force_exit": "on",
+                "exit_signal": "on",
+                "trailing_stop_loss": "on",
+                "stop_loss": "on",
+                "stoploss_on_exchange": "on",
+                "custom_exit": "on"
+            },
+            "exit_fill": "on",
+            "entry_cancel": "on",
+            "exit_cancel": "on",
+            "protection_trigger": "on",
+            "protection_trigger_global": "on",
+            "show_candle": "off"
+        },
+        "reload": true,
+        "balance_dust_level": 0.01,
+        "keyboard": [
+            ["/analysis", "/daily", "/profit"],
+            ["/status", "/balance", "/smc", "/scalp"],
+            ["/start", "/stop", "/help"]
+        ]
+    },
+    "api_server": {
+        "enabled": false,
+        "listen_ip_address": "127.0.0.1",
+        "listen_port": 8080,
+        "verbosity": "error",
+        "enable_openapi": false,
+        "_comment_secrets": "GIÁ TRỊ GIẢ — file này đã vào git (repo public) từ 2026-08-11, nên jwt_secret_key và password ở đây KHÔNG được là secret thật. Giá trị thật nạp từ .env lúc chạy: FREQTRADE__API_SERVER__JWT_SECRET_KEY và FREQTRADE__API_SERVER__PASSWORD (xem .env.example và docker-compose.smc.yml — image bake sẵn hai khoá này nên .env BẮT BUỘC đè). Chạy trực tiếp trên host không có .env thì đây vẫn là secret công khai, ai đọc repo cũng biết: api_server chỉ bind 127.0.0.1, đừng mở ra ngoài khi chưa đổi.",
+        "jwt_secret_key": "somethingRandomSomethingRandom123",
+        "CORS_origins": [],
+        "username": "freqtrader",
+        "password": "ChangeMeSuperSecurePassword123"
+    },
+    "strategy": "SmcElliottStrategy",
+    "bot_name": "freqtrade",
+    "initial_state": "running",
+    "force_entry_enable": false,
+    "internals": {
+        "process_throttle_secs": 5
+    },
+    "_comment_db": "DB RIÊNG cho futures, theo đúng tiền lệ config-4h.json. tradesv3.dryrun.sqlite (25 trade spot) giữ nguyên để tra cứu — trộn trade spot và futures vào một DB làm hỏng thống kê /profit, /daily. Lúc chuyển không có lệnh nào đang mở nên không mất vị thế.",
+    "db_url": "sqlite:///tradesv3.dryrun-futures.sqlite"
+}

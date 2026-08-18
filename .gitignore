@@ -114,4 +114,39 @@ target/
 !config_examples/config_kraken.example.json
 !config_examples/config_freqai.example.json
 
+# Config THẬT của các bot SMC — theo dõi trong git từ 2026-08-11 theo yêu cầu, để hai máy
+# (dev + server) không còn lệch config một cách âm thầm. An toàn được vì mọi secret đều
+# rỗng hoặc là giá trị giả trong file: exchange.key/secret và telegram.token/chat_id để
+# trống, api_server.jwt_secret_key/password là placeholder — giá trị thật nạp từ .env
+# (vẫn ignored, dòng 103) qua biến FREQTRADE__*. REPO NÀY LÀ PUBLIC.
+# Danh sách CỐ Ý liệt kê từng file thay vì bỏ hẳn `config*.json` ở dòng 2: config mới tạo
+# vẫn bị ignore theo mặc định, phải thêm một dòng ở đây thì mới vào git — đó là chốt chặn
+# để không ai lỡ tay commit một config còn nguyên API key. Thêm file mới thì soát secret
+# trước, rồi mới thêm dòng.
+!config.json
+!config-4h.json
+!config-5m.json
+!config-ict-futures.json
+!config-scalp-bt.json
+!config-scalp-bt-C.json
+
 docker-compose-*.yml
+
+# Bản sao lưu tay của config: `config*.json` ở dòng 2 KHÔNG bắt được chúng vì tên
+# không kết thúc bằng .json (vd config-4h.json.bak-spot197). Chúng là config thật,
+# phải nằm ngoài git giống bản gốc.
+*.bak
+*.bak-*
+*.bak[0-9]*
+
+# BMad
+_bmad-output/
+# Personal install answers (BMad's own convention: *.user.toml is per-user)
+_bmad/**/*.user.toml
+
+# Claude
+.claude/*
+!.claude/skills/
+
+# Strategy nguồn nằm ở strategies/ (được track) — user_data/strategies/ chỉ chứa
+# symlink do ./sync_strategies.sh tạo, nên vẫn ignore theo rule user_data/* ở trên.

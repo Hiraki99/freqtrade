@@ -1,0 +1,109 @@
+# ONE image for BOTH SMC bots — the Docker equivalent of `./run_smc.sh` and `./run_smc_5.sh`
+# with no arguments. See docs/docker-smc.md.
+#
+#   4h swing   : CMD below (default)                      -> service freqtrade-smc
+#   5m scalping: `command:` override in the compose file   -> service freqtrade-smc-5m
+#
+# Both bots run the same SmcElliottStrategy off the same freqtrade package, so a second image
+# would only duplicate a 1 GB layer stack and add a way for the two to drift apart. What differs
+# is entirely in the config layers, which is a runtime argument, not a build artifact.
+#
+# This MUST be built from this repository. freqtrade/rpc/telegram.py is fork-local and adds the
+# /analysis and /smc commands, so freqtradeorg/freqtrade images will not work.
+#
+# Strategies and configs are baked in: editing strategies/SmcElliottStrategy.py, config.json,
+# config-4h.json or config-5m.json has no effect until the image is rebuilt.
+#
+# Build context is the repository root. docker/Dockerfile.smc.dockerignore (BuildKit) controls
+# what enters that context — it deliberately admits config.json, which the root .dockerignore
+# excludes.
+#
+#   docker compose -f docker-compose.smc.yml build
+
+FROM python:3.14.6-slim-trixie AS base
+
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONFAULTHANDLER=1
+ENV PATH=/home/ftuser/.local/bin:$PATH
+ENV FT_APP_ENV="docker"
+
+# tzdata is required beyond the upstream package list: the fork's /analysis scheduler resolves
+# ZoneInfo(config.telegram.analysis_schedule.timezone), which needs the system tz database.
+RUN mkdir /freqtrade \
+  && apt-get update \
+  && apt-get -y install --no-install-recommends sudo libatlas3-base curl sqlite3 libgomp1 tzdata \
+  && apt-get clean \
+  && rm -rf /var/lib/apt/lists/* \
+  && useradd -u 1000 -G sudo -U -m -s /bin/bash ftuser \
+  && chown ftuser:ftuser /freqtrade \
+  && echo "ftuser ALL=(ALL) NOPASSWD: /bin/chown" >> /etc/sudoers
+
+WORKDIR /freqtrade
+
+# Build dependencies in a throwaway stage so compilers never reach the runtime image.
+FROM base AS python-deps
+RUN  apt-get update \
+  && apt-get -y install --no-install-recommends build-essential libssl-dev git libffi-dev libgfortran5 pkg-config cmake gcc \
+  && apt-get clean \
+  && rm -rf /var/lib/apt/lists/* \
+  && pip install --upgrade pip wheel
+
+# requirements.txt only — hyperopt and plotting are out of scope for this trade-only image.
+COPY --chown=ftuser:ftuser requirements.txt /freqtrade/
+USER ftuser
+RUN  pip install --user --no-cache-dir "numpy<3.0" \
+  && pip install --user --no-cache-dir -r requirements.txt
+
+FROM base AS runtime-image
+
+COPY --from=python-deps --chown=ftuser:ftuser /home/ftuser/.local /home/ftuser/.local
+
+USER ftuser
+
+# This is the bake: strategies/, config.json, config-4h.json, config-5m.json and both
+# docker/smc*-overrides.json arrive here.
+#
+# NOT a secret-free image. .env is excluded, so the Telegram token and exchange key/secret stay
+# out — those fields are empty in config.json and are supplied at runtime. But config.json also
+# carries api_server.password and jwt_secret_key, and those ARE baked. Rotate them via
+# FREQTRADE__API_SERVER__PASSWORD / FREQTRADE__API_SERVER__JWT_SECRET_KEY in .env before this
+# image leaves the machine. See docs/docker-smc.md §5.
+COPY --chown=ftuser:ftuser . /freqtrade/
+
+# Copy the config files explicitly as well. `COPY .` above SILENTLY omits anything the
+# ignore file filters, which would produce an image that builds fine and then crash-loops at
+# startup with "config file not found". These explicit copies fail the build instead — which is
+# what happens on a non-BuildKit builder, where the root .dockerignore (`config.json*`, `docker/`)
+# applies rather than Dockerfile.smc.dockerignore.
+#
+# config-5m.json is listed here even though only the 5m service reads it: a missing config must
+# break the build, not the one container out of two that happens to need it.
+COPY --chown=ftuser:ftuser config.json config-4h.json config-5m.json /freqtrade/
+COPY --chown=ftuser:ftuser docker/smc-overrides.json docker/smc-5m-overrides.json /freqtrade/docker/
+
+# install-ui is deliberately non-fatal: it downloads a FreqUI release from GitHub, and an
+# unauthenticated rate limit or an offline build must not block a trading bot that does not
+# need the web UI.
+RUN pip install -e . --user --no-cache-dir \
+  && mkdir -p /freqtrade/user_data/logs \
+  && (freqtrade install-ui || echo "WARNING: FreqUI install skipped — REST API still works")
+
+# Documentation only — publishing is done by the compose file. 8091 = 4h, 8082 = 5m.
+EXPOSE 8091 8082
+
+ENTRYPOINT ["freqtrade"]
+
+# Default = the 4h bot, mirroring the no-argument branch of run_smc.sh. Configs deep-merge left
+# to right, so smc-overrides.json wins on db_url and api_server.listen_ip_address.
+#
+# The 5m bot is the same command with config-5m.json + docker/smc-5m-overrides.json and a
+# different logfile — see the `command:` block of service freqtrade-smc-5m in the compose files.
+CMD ["trade", \
+     "--strategy", "SmcElliottStrategy", \
+     "--strategy-path", "/freqtrade/strategies", \
+     "--config", "/freqtrade/config.json", \
+     "--config", "/freqtrade/config-4h.json", \
+     "--config", "/freqtrade/docker/smc-overrides.json", \
+     "--logfile", "/freqtrade/user_data/logs/smc-4h.log"]
