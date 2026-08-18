@@ -144,7 +144,8 @@ _bmad/
 _bmad-output/
 
 # Claude
-.claude/
+.claude/*
+!.claude/skills/
 
 # Strategy nguồn nằm ở strategies/ (được track) — user_data/strategies/ chỉ chứa
 # symlink do ./sync_strategies.sh tạo, nên vẫn ignore theo rule user_data/* ở trên.
